@@ -86,6 +86,42 @@ def annual_rate_for_days(annual_rate, days):
     return (1.0 + annual_rate) ** (max(days, 0) / 365.0) - 1.0
 
 
+def initial_advance_interest_amount(facility_amount, annual_rate, settlement, months):
+    settlement = parse_date(settlement, date.today())
+    months = max(0, int(months))
+    return sum(max(0.0, float(facility_amount)) * annual_rate_for_days(
+        float(annual_rate), max((add_months(settlement, month_index + 1)
+        - add_months(settlement, month_index)).days, 1)) for month_index in range(months))
+
+
+def capitalised_interest_for_period(principal, start_date, end_date, annual_rate, receipt_events=None):
+    """Accrue ACT/365 capitalised interest on the changing balance between dated principal receipts."""
+    start_date = parse_date(start_date)
+    end_date = parse_date(end_date, start_date)
+    if start_date is None or end_date is None or end_date <= start_date:
+        return 0.0
+    balance = max(0.0, float(principal))
+    cursor = start_date
+    total_interest = 0.0
+    events = [event for event in (receipt_events or []) if isinstance(event, dict)]
+    events.sort(key=lambda event: parse_date(event.get("receipt_date"), end_date))
+    for event in events:
+        event_date = parse_date(event.get("receipt_date"), end_date)
+        if event_date < start_date or event_date > end_date:
+            continue
+        if event_date > cursor and balance > 0:
+            accrued = balance * annual_rate_for_days(annual_rate, (event_date - cursor).days)
+            balance += accrued
+            total_interest += accrued
+        principal_received = max(0.0, float(event.get("principal", 0.0) or 0.0))
+        balance = max(0.0, balance - principal_received)
+        cursor = max(cursor, event_date)
+    if end_date > cursor and balance > 0:
+        accrued = balance * annual_rate_for_days(annual_rate, (end_date - cursor).days)
+        total_interest += accrued
+    return total_interest
+
+
 def money(value, decimals=0):
     if value is None:
         return "—"
@@ -267,7 +303,7 @@ def resolve_drawdown_profile(facility_type, requested_profile):
         return "S-curve"
     if facility_type == "Revolving":
         return "Straight-line"
-    # Bridging, residential, term and mezzanine default to a single settlement draw.
+    # Bridging, residual stock, residential, term and mezzanine default to a single settlement draw.
     return "Full at settlement"
 
 
@@ -520,17 +556,25 @@ def build_schedule(params, actuals_map, drawdown_map):
     property_value = float(params.get("property_value", 0.0))
     property_growth = float(params.get("pv_growth_annual", 3.0)) / 100.0
     covenant_lvr = float(params.get("covenant_lvr", 75.0))
+    facility_type = str(params.get("facility_type", ""))
     fees = compute_fees(params)
+    raw_interest_treatment = str(params.get("interest_treatment", "Serviced")).strip().lower()
+    interest_treatment = "Capitalised" if raw_interest_treatment in ["capitalised", "capitalized"] else "Serviced"
     advance_setting = params.get("interest_advance_months", 1)
     all_interest_in_advance = str(advance_setting).strip().lower() == "all"
     try:
         advance_months = term if all_interest_in_advance else max(1, min(term, int(advance_setting)))
     except (TypeError, ValueError):
         advance_months = 1
-    initial_advance_interest = sum(
-        facility_amount * annual_rate_for_days(annual_rate,
-            max((add_months(settlement, month_index + 1) - add_months(settlement, month_index)).days, 1))
-        for month_index in range(advance_months))
+    if interest_treatment == "Capitalised":
+        advance_months = 0
+        all_interest_in_advance = False
+    initial_advance_interest = (initial_advance_interest_amount(
+        facility_amount, annual_rate, settlement, advance_months)
+        if interest_treatment == "Serviced" else 0.0)
+    net_advance_interest_from_proceeds = (interest_treatment == "Serviced"
+        and all_interest_in_advance
+        and facility_type.strip().lower() in ["bridging", "residual stock"])
 
     rows = []
     balance = 0.0
@@ -554,6 +598,12 @@ def build_schedule(params, actuals_map, drawdown_map):
         payment_date = add_months(settlement, index + 1)
         days = max((payment_date - draw_date).days, 1)
         actual = actuals_map.get(payment_date.isoformat(), {})
+        raw_period_events = actual.get("_receipt_events", []) if isinstance(actual, dict) else []
+        period_receipt_events = ([event for event in raw_period_events if isinstance(event, dict)]
+                                 if isinstance(raw_period_events, list) else [])
+        period_payoff_dates = [parse_date(event.get("receipt_date"), payment_date)
+                               for event in period_receipt_events if bool(event.get("is_payoff", False))]
+        period_payoff_date = min(period_payoff_dates) if period_payoff_dates else None
         plan_item = drawdown_map.get(draw_date.isoformat(), {})
         if isinstance(plan_item, dict):
             planned_draw = max(0.0, float(plan_item.get("gross_draw", plan_item.get("amount", 0.0))))
@@ -578,16 +628,27 @@ def build_schedule(params, actuals_map, drawdown_map):
 
         opening_balance = balance
         upfront_deducted = 0.0
-        if gross_draw > 0 and not first_draw_done:
+        is_first_draw = gross_draw > 0 and not first_draw_done
+        if is_first_draw:
             upfront_deducted = min(fees["upfront_total"], gross_draw)
             first_draw_done = True
-        net_draw = gross_draw - upfront_deducted
+        investor_funding = max(0.0, gross_draw - upfront_deducted)
+        advance_interest_withheld = (min(initial_advance_interest, investor_funding)
+            if index == 0 and is_first_draw and net_advance_interest_from_proceeds else 0.0)
+        net_draw = max(0.0, investor_funding - advance_interest_withheld)
         balance_after_draw = opening_balance + gross_draw
         cumulative_drawn += gross_draw
 
-        interest_accrued = (0.0 if after_payoff else
-            (facility_amount if index < advance_months else balance_after_draw) * annual_rate_for_days(annual_rate, days))
         if after_payoff:
+            interest_accrued = 0.0
+        elif interest_treatment == "Capitalised":
+            accrual_end = min(payment_date, period_payoff_date) if period_payoff_date else payment_date
+            interest_accrued = capitalised_interest_for_period(
+                balance_after_draw, draw_date, accrual_end, annual_rate, period_receipt_events)
+        else:
+            interest_principal = facility_amount if index < advance_months else balance_after_draw
+            interest_accrued = interest_principal * annual_rate_for_days(annual_rate, days)
+        if after_payoff or interest_treatment == "Capitalised":
             interest_due = 0.0
         elif index == 0:
             interest_due = initial_advance_interest
@@ -595,7 +656,11 @@ def build_schedule(params, actuals_map, drawdown_map):
             interest_due = 0.0
         else:
             interest_due = interest_accrued
-        # Unpaid interest remains a separate arrears balance; penalty interest is charged on it.
+        capitalised_interest = interest_accrued if interest_treatment == "Capitalised" else 0.0
+        balance_after_capitalisation = balance_after_draw + capitalised_interest
+        principal_base = balance_after_capitalisation
+
+        # Unpaid serviced interest remains separate arrears; capitalised interest is principal.
         arrears_opening = arrears
         in_construction = index < construction_months
         undrawn = max(facility_amount - cumulative_drawn, 0.0)
@@ -604,13 +669,17 @@ def build_schedule(params, actuals_map, drawdown_map):
         discharge_fee = fees["discharge"] if index == term - 1 and not after_payoff else 0.0
 
         smm = 1.0 - (1.0 - cpr) ** (days / 365.0) if cpr > 0 else 0.0
-        prepayment = balance_after_draw * smm if not after_payoff and not in_construction and balance_after_draw > 0 else 0.0
+        prepayment = principal_base * smm if not after_payoff and not in_construction and principal_base > 0 else 0.0
         if in_construction or after_payoff:
             scheduled_principal = 0.0
         else:
             remaining_payments = max(term - index, 1)
-            scheduled_principal = balance_after_draw / remaining_payments
-        contract_principal = min(balance_after_draw, scheduled_principal + prepayment)
+            scheduled_principal = principal_base / remaining_payments
+        maturity_repayment = 0.0
+        if index == term - 1 and not after_payoff and not period_payoff_dates:
+            maturity_repayment = max(0.0, principal_base - min(principal_base, scheduled_principal + prepayment))
+        contract_principal = min(principal_base,
+            scheduled_principal + prepayment + maturity_repayment)
 
         has_payment_actuals = bool(actual.get("payment_actuals_logged", False))
         actual_interest = max(0.0, float(actual.get("actual_interest", 0.0) or 0.0)) if has_payment_actuals else None
@@ -620,13 +689,10 @@ def build_schedule(params, actuals_map, drawdown_map):
                                    if has_payment_actuals else None)
         servicing_interest_due = interest_due
         if has_payment_actuals:
-            # A payoff charges accrued interest through its date, while retaining the initial prepaid minimum.
-            events = actual.get("_receipt_events", [])
-            events = [event for event in events if isinstance(event, dict)] if isinstance(events, list) else []
-            payoff_dates = [parse_date(event.get("receipt_date"), payment_date) for event in events
-                            if bool(event.get("is_payoff", False))]
-            accrual_end = min([payment_date] + payoff_dates) if payoff_dates else payment_date
-            if payoff_dates:
+            # Serviced payoff interest is charged through the payoff date, preserving any prepaid minimum.
+            events = list(period_receipt_events)
+            accrual_end = min([payment_date] + period_payoff_dates) if period_payoff_dates else payment_date
+            if period_payoff_dates and interest_treatment == "Serviced":
                 days_to_payoff = max((accrual_end - draw_date).days, 0)
                 payoff_principal = facility_amount if index < advance_months else balance_after_draw
                 partial_accrual = payoff_principal * annual_rate_for_days(annual_rate, days_to_payoff)
@@ -636,8 +702,9 @@ def build_schedule(params, actuals_map, drawdown_map):
                 servicing_interest_due = max(0.0, required_through_payoff - baseline_before_period)
                 interest_accrued = partial_accrual
                 interest_due = servicing_interest_due
-            # Charge ACT/365 interest on overdue interest only, stopping/adjusting as receipts arrive.
-            accrual_balance = arrears_opening + servicing_interest_due
+            cash_servicing_interest_due = max(0.0, servicing_interest_due - advance_interest_withheld)
+            # Charge ACT/365 interest on overdue serviced interest only, stopping at receipts.
+            accrual_balance = arrears_opening + cash_servicing_interest_due
             accrual_cursor = draw_date
             penalty_interest = 0.0
             event_interest_total = sum(max(0.0, float(event.get("interest", 0.0) or 0.0)) for event in events)
@@ -660,22 +727,27 @@ def build_schedule(params, actuals_map, drawdown_map):
             if accrual_end > accrual_cursor and accrual_balance > 0:
                 penalty_interest += accrual_balance * annual_rate_for_days(
                     annual_rate, (accrual_end - accrual_cursor).days)
-            # Penalty charges are separate; only unpaid contractual interest remains in arrears.
-            arrears = max(0.0, arrears_opening + servicing_interest_due - float(actual_interest or 0.0))
-            principal_applied = min(float(actual_principal or 0.0), balance_after_draw)
+            # Penalty charges are separate; prepaid interest withheld at settlement is already paid.
+            arrears = max(0.0, arrears_opening + cash_servicing_interest_due - float(actual_interest or 0.0))
+            principal_applied = min(float(actual_principal or 0.0), principal_base)
             cash_interest_received = float(actual_interest or 0.0) + float(actual_penalty_interest or 0.0)
             cash_principal_received = float(actual_principal or 0.0)
             cash_fees_received = float(actual_fees or 0.0)
         else:
             penalty_interest = arrears_opening * annual_rate_for_days(annual_rate, days) if arrears_opening > 0 else 0.0
+            cash_servicing_interest_due = max(0.0, servicing_interest_due - advance_interest_withheld)
             principal_applied = contract_principal
-            cash_interest_received = interest_due + penalty_interest
+            cash_interest_advance = (cash_servicing_interest_due
+                if interest_treatment == "Serviced" else 0.0)
+            cash_interest_received = cash_interest_advance + penalty_interest
             cash_principal_received = contract_principal
             cash_fees_received = line_fee + admin_fee + discharge_fee
-        total_due = (arrears_opening + servicing_interest_due + penalty_interest + contract_principal
+        if has_payment_actuals:
+            cash_interest_advance = 0.0
+        total_due = (arrears_opening + cash_servicing_interest_due + penalty_interest + contract_principal
                      + line_fee + admin_fee + discharge_fee)
 
-        ending_balance = max(0.0, balance_after_draw - principal_applied)
+        ending_balance = max(0.0, balance_after_capitalisation - principal_applied)
         elapsed_days = max((payment_date - settlement).days, 0)
         current_property_value = (property_value * ((1.0 + property_growth) ** (elapsed_days / 365.0))
                                  if property_value > 0 else 0.0)
@@ -700,8 +772,8 @@ def build_schedule(params, actuals_map, drawdown_map):
             if manual_total > 0:
                 borrower_cashflows.append((payment_date, manual_total))
         else:
-            if interest_due > 0:
-                borrower_cashflows.append((draw_date, interest_due))
+            if cash_interest_advance > 0:
+                borrower_cashflows.append((draw_date, cash_interest_advance))
             payment_cashflow = penalty_interest + contract_principal + line_fee + admin_fee + discharge_fee
             if payment_cashflow > 0:
                 borrower_cashflows.append((payment_date, payment_cashflow))
@@ -717,9 +789,13 @@ def build_schedule(params, actuals_map, drawdown_map):
             "Investor_Allocations": investor_allocations,
             "Drawdown_Gross": gross_draw,
             "Upfront_Fees_Deducted": upfront_deducted,
+            "Advance_Interest_Withheld": advance_interest_withheld,
+            "Investor_Funding": investor_funding,
             "Drawdown_Net": net_draw,
             "Opening_Balance": opening_balance,
             "Balance_After_Draw": balance_after_draw,
+            "Capitalised_Interest": capitalised_interest,
+            "Balance_After_Capitalisation": balance_after_capitalisation,
             "Interest_Accrued": interest_accrued,
             "Interest_Due": interest_due,
             "Penalty_Interest": penalty_interest,
@@ -728,19 +804,20 @@ def build_schedule(params, actuals_map, drawdown_map):
             "Discharge_Fee": discharge_fee,
             "Scheduled_Principal": scheduled_principal,
             "Prepayment": prepayment,
+            "Maturity_Repayment": maturity_repayment,
             "Contract_Principal_Due": contract_principal,
             "Principal_Applied": principal_applied,
             "Total_Due": total_due,
             "Arrears_Opening": arrears_opening,
             "Servicing_Interest_Due": servicing_interest_due,
-            "Total_Interest_Due": arrears_opening + servicing_interest_due + penalty_interest,
+            "Total_Interest_Due": arrears_opening + cash_servicing_interest_due + penalty_interest,
             "Actual_Interest": actual_interest,
             "Actual_Penalty_Interest": actual_penalty_interest,
             "Actual_Principal": actual_principal,
             "Actual_Fees": actual_fees,
             "Cash_Interest_Received": cash_interest_received,
             "Cash_Penalty_Interest_Received": float(actual_penalty_interest or 0.0) if has_payment_actuals else penalty_interest,
-            "Cash_Interest_Advance": 0.0 if has_payment_actuals else interest_due,
+            "Cash_Interest_Advance": cash_interest_advance,
             "Cash_Arrears_Interest": float(actual_penalty_interest or 0.0) if has_payment_actuals else penalty_interest,
             "Cash_Principal_Received": cash_principal_received,
             "Cash_Fees_Received": cash_fees_received,
@@ -777,8 +854,14 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
             if period_date is not None:
                 receipt_events_by_period.setdefault(period_date.isoformat(), []).append(receipt_row)
     investor_names = investors_df["name"].astype(str).tolist() if not investors_df.empty else []
-    target_rates = {str(row["name"]): float(row.get("target_irr", 8.0)) / 100.0
-                    for _, row in investors_df.iterrows()}
+    try:
+        shared_target_pct = float(params.get("investor_target_irr", 8.0))
+        if not np.isfinite(shared_target_pct):
+            shared_target_pct = 8.0
+    except (TypeError, ValueError):
+        shared_target_pct = 8.0
+    shared_target_rate = shared_target_pct / 100.0
+    target_rates = {name: shared_target_rate for name in investor_names}
 
     # Keep historical transaction counterparties and any legacy allocation names visible.
     if not transactions_df.empty:
@@ -799,7 +882,7 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
                     if str(name) not in investor_names:
                         investor_names.append(str(name))
     for name in investor_names:
-        target_rates.setdefault(name, 0.08)
+        target_rates.setdefault(name, shared_target_rate)
 
     balances = {name: 0.0 for name in investor_names}
     total_funded = {name: 0.0 for name in investor_names}
@@ -859,6 +942,7 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
         draw_date = parse_date(schedule_row["Drawdown_Date"])
         payment_date = parse_date(schedule_row["Payment_Date"])
         net_draw = float(schedule_row["Drawdown_Net"])
+        investor_funding = float(schedule_row.get("Investor_Funding", net_draw) or 0.0)
         raw_allocations = schedule_row.get("Investor_Allocations", {})
         if isinstance(raw_allocations, str):
             raw_allocations = safe_json(raw_allocations, {})
@@ -866,8 +950,8 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
         source = str(schedule_row.get("Allocation_Source", "Standard"))
         allocations = {name: max(0.0, float(raw_allocations.get(name, 0.0) or 0.0))
                        for name in investor_names}
-        if net_draw > 0 and source == "Standard":
-            allocations = {name: net_draw * standard_split_for(name, loan_ranking) / 100.0
+        if investor_funding > 0 and source == "Standard":
+            allocations = {name: investor_funding * standard_split_for(name, loan_ranking) / 100.0
                            for name in investor_names}
 
         period_capital_called = {name: allocations.get(name, 0.0) for name in investor_names}
@@ -894,7 +978,7 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
             days = max((until_date - cursor).days, 0)
             for investor_name in list(balances):
                 accrued_interest[investor_name] = accrued_interest.get(investor_name, 0.0) + balances[investor_name] * annual_rate_for_days(
-                    target_rates.get(investor_name, 0.08), days)
+                    target_rates.get(investor_name, shared_target_rate), days)
             cursor = until_date
 
         period_events[period_index].sort(key=lambda event: (event[0], event[1]))
@@ -1108,7 +1192,7 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
             "Total_Interest_Earned": total_interest.get(name, 0.0),
             "Total_Principal_Returned": total_principal_returned.get(name, 0.0),
             "Outstanding_Balance": balances.get(name, 0.0),
-            "Target_XIRR": target_rates.get(name, 0.08) * 100.0,
+            "Target_XIRR": target_rates.get(name, shared_target_rate) * 100.0,
             "Actual_XIRR": calc_xirr(cashflows.get(name, [])) * 100.0,
         })
     summary_df = pd.DataFrame(summary_rows, columns=["Investor", "Total_Funded", "Total_Interest_Earned",
@@ -1122,6 +1206,8 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
 
 def build_pnl(schedule_df, fees, investor_summary_df, params):
     borrower_interest = float(schedule_df["Interest_Due"].sum())
+    if "Capitalised_Interest" in schedule_df.columns:
+        borrower_interest += float(schedule_df["Capitalised_Interest"].sum())
     penalty_interest = float(schedule_df["Penalty_Interest"].sum())
     line_fees = float(schedule_df["Line_Fee"].sum())
     admin_fees = float(schedule_df["Admin_Fee"].sum())
@@ -1618,6 +1704,7 @@ def default_facility_model_params(facility_row):
         "drawdown_profile": str(params.get("drawdown_profile", "Automatic")),
         "s_curve_steepness": float(params.get("s_curve_steepness", 5.0)),
         "loan_ranking": str(params.get("loan_ranking", facility_row.get("loan_ranking", "Senior"))),
+        "interest_treatment": str(params.get("interest_treatment", "Serviced")),
         "interest_advance_months": params.get("interest_advance_months", 1),
     })
     if not params.get("drawdown_schedule"):
@@ -1638,11 +1725,13 @@ def default_facility_model_params(facility_row):
 
 
 def contractual_interest_through(schedule_df, params, cutoff_date):
-    """Accrue contractual interest through an actual date on the facility balance."""
+    """Accrue ACT/365 contractual interest through an actual date."""
     settlement = parse_date(params.get("settlement_date"), date.today())
     cutoff = parse_date(cutoff_date, settlement)
     if cutoff <= settlement or schedule_df.empty:
         return 0.0
+    raw_treatment = str(params.get("interest_treatment", "Serviced")).strip().lower()
+    capitalised = raw_treatment in ["capitalised", "capitalized"]
     advance_setting = params.get("interest_advance_months", 1)
     try:
         advance_months = (int(params.get("term_months", len(schedule_df)))
@@ -1650,6 +1739,8 @@ def contractual_interest_through(schedule_df, params, cutoff_date):
             else max(1, min(int(params.get("term_months", len(schedule_df))), int(advance_setting))))
     except (TypeError, ValueError):
         advance_months = 1
+    if capitalised:
+        advance_months = 0
     facility_amount = max(0.0, float(params.get("facility_amount", 0.0) or 0.0))
     rate = float(params.get("borrower_irr", 12.0)) / 100.0
     total = 0.0
@@ -1660,7 +1751,11 @@ def contractual_interest_through(schedule_df, params, cutoff_date):
             continue
         segment_end = min(end, cutoff)
         days = max((segment_end - start).days, 0)
-        principal = facility_amount if index < advance_months else max(0.0, float(row.get("Balance_After_Draw", 0.0) or 0.0))
+        if capitalised:
+            principal = max(0.0, float(row.get("Balance_After_Draw", 0.0) or 0.0))
+        else:
+            principal = (facility_amount if index < advance_months
+                else max(0.0, float(row.get("Balance_After_Draw", 0.0) or 0.0)))
         total += principal * annual_rate_for_days(rate, days)
         if cutoff <= end:
             break
@@ -1677,6 +1772,8 @@ def arrears_penalty_through(period_row, params, previous_period, cutoff_date, in
     rate = float(params.get("borrower_irr", 12.0)) / 100.0
     scheduled_interest = (float(period_row.get("Interest_Due", 0.0) or 0.0)
                           if interest_due is None else float(interest_due))
+    scheduled_interest = max(0.0, scheduled_interest
+        - float(period_row.get("Advance_Interest_Withheld", 0.0) or 0.0))
     outstanding = max(0.0, float(period_row.get("Arrears_Opening", 0.0) or 0.0) + scheduled_interest)
     cursor = start
     accrued = 0.0
@@ -1727,34 +1824,67 @@ def suggest_receipt_allocations(parent_deal_id, receipt_date, amount,
         fees_due = max(0.0, float(current["Line_Fee"] + current["Admin_Fee"])
                        + (compute_fees(params)["discharge"] if is_payoff else float(current["Discharge_Fee"]))
                        - prior_fees)
+        raw_treatment = str(params.get("interest_treatment", "Serviced")).strip().lower()
+        capitalised = raw_treatment in ["capitalised", "capitalized"]
         penalty_cutoff = receipt_date
+        payoff_period_interest_due = 0.0
         if is_payoff:
             cutoff = min(parse_date(interest_through_date, receipt_date), receipt_date)
             cutoff = max(cutoff, settlement)
             penalty_cutoff = cutoff
-            minimum_interest = float(schedule.iloc[0]["Interest_Due"])
-            required_contract_interest = max(minimum_interest,
-                contractual_interest_through(schedule, params, cutoff))
+            minimum_interest = 0.0 if capitalised else float(schedule.iloc[0]["Interest_Due"])
+            required_contract_interest = (0.0 if capitalised else max(minimum_interest,
+                contractual_interest_through(schedule, params, cutoff)))
             current_index = int(schedule.index[schedule["Payment_Date"] == period_date][0])
             prior_accrued = float(schedule.iloc[:current_index]["Interest_Accrued"].sum()) if current_index > 0 else 0.0
             baseline_before_period = 0.0 if current_index == 0 else max(minimum_interest, prior_accrued)
-            payoff_period_interest_due = max(0.0, required_contract_interest - baseline_before_period)
+            payoff_period_interest_due = (0.0 if capitalised else
+                max(0.0, required_contract_interest - baseline_before_period))
             if not previous.empty:
                 paid_dates = pd.to_datetime(previous["receipt_date"], errors="coerce").dt.date
                 paid_before_cutoff = previous[paid_dates <= cutoff]
                 prior_contract_interest = float(paid_before_cutoff["interest"].fillna(0).sum())
             else:
                 prior_contract_interest = 0.0
-            interest_due = max(0.0, required_contract_interest - prior_contract_interest)
+            prepaid_interest_credit = 0.0
+            if not capitalised and "Advance_Interest_Withheld" in schedule:
+                draw_dates = pd.to_datetime(schedule["Drawdown_Date"], errors="coerce").dt.date
+                prepaid_interest_credit = float(schedule.loc[draw_dates <= cutoff,
+                    "Advance_Interest_Withheld"].fillna(0).sum())
+            interest_due = (0.0 if capitalised else max(0.0,
+                required_contract_interest - prior_contract_interest - prepaid_interest_credit))
         else:
             cutoff = max(settlement, last_settlement_anniversary(settlement, receipt_date))
             due_rows = schedule[pd.to_datetime(schedule["Interest_Due_Date"]).dt.date <= cutoff]
-            required_contract_interest = float(due_rows["Interest_Due"].fillna(0).sum())
+            required_contract_interest = 0.0 if capitalised else float(due_rows["Interest_Due"].fillna(0).sum())
             prior_contract_interest = float(previous["interest"].fillna(0).sum()) if not previous.empty else 0.0
-            interest_due = max(0.0, required_contract_interest - prior_contract_interest)
+            prepaid_interest_credit = 0.0
+            if not capitalised and "Advance_Interest_Withheld" in schedule:
+                draw_dates = pd.to_datetime(schedule["Drawdown_Date"], errors="coerce").dt.date
+                prepaid_interest_credit = float(schedule.loc[draw_dates <= cutoff,
+                    "Advance_Interest_Withheld"].fillna(0).sum())
+            interest_due = (0.0 if capitalised else max(0.0,
+                required_contract_interest - prior_contract_interest - prepaid_interest_credit))
         penalty_due = arrears_penalty_through(current, params, period_previous, penalty_cutoff,
             payoff_period_interest_due if is_payoff else None)
-        principal_available = max(0.0, float(current["Balance_After_Draw"]) - prior_period_principal)
+        if capitalised:
+            accrual_cutoff = penalty_cutoff
+            current_draw_date = parse_date(current["Drawdown_Date"], settlement)
+            starting_balance = max(0.0, float(current["Balance_After_Draw"]))
+            event_rows = period_previous.copy()
+            if not event_rows.empty:
+                event_dates = pd.to_datetime(event_rows["receipt_date"], errors="coerce").dt.date
+                event_rows = event_rows[event_dates <= accrual_cutoff]
+            receipt_events = event_rows.to_dict("records") if not event_rows.empty else []
+            capitalised_accrual = capitalised_interest_for_period(starting_balance,
+                current_draw_date, accrual_cutoff, float(params.get("borrower_irr", 12.0)) / 100.0,
+                receipt_events)
+            principal_received_before_cutoff = sum(max(0.0, float(row.get("principal", 0.0) or 0.0))
+                for row in receipt_events)
+            principal_available = max(0.0,
+                starting_balance + capitalised_accrual - principal_received_before_cutoff)
+        else:
+            principal_available = max(0.0, float(current["Balance_After_Draw"]) - prior_period_principal)
         facility_rows.append({"facility_deal_id": int(facility["id"]), "Facility": str(facility["facility_name"]),
             "Ranking": rank, "period_date": period_date, "fees_available": fees_due,
             "penalty_available": penalty_due, "interest_available": interest_due,
@@ -1930,7 +2060,7 @@ def page_borrowers():
 # PAGE: DEALS
 # ═══════════════════════════════════════════════════════════════
 
-FACILITY_TYPES = ["Construction", "Bridging", "Residential", "Term Loan", "Revolving"]
+FACILITY_TYPES = ["Construction", "Bridging", "Residual Stock", "Residential", "Term Loan", "Revolving"]
 SECURITY_TYPES = ["First Mortgage", "Second Mortgage", "Unsecured", "Personal Guarantee", "Other"]
 
 
@@ -1959,7 +2089,7 @@ def page_deals():
             c7, c8, c9 = st.columns(3)
             facility_type = c7.selectbox("Facility purpose / type", FACILITY_TYPES)
             loan_ranking = c8.selectbox("Loan ranking", ["Senior", "Mezzanine"],
-                help="Ranking controls the default investor split; construction/bridge/residential controls the drawdown profile.")
+                help="Ranking controls the default investor split; construction controls the drawdown curve, while bridge/residual stock/residential typically draw at settlement.")
             security_type = c9.selectbox("Security type", SECURITY_TYPES)
             property_value = st.number_input("Property / security value", min_value=0.0,
                                              value=8_000_000.0, step=100_000.0)
@@ -1971,7 +2101,9 @@ def page_deals():
                 else:
                     borrower_id = borrower_labels[borrower_label]
                     save_deal(borrower_id, deal_name.strip(), facility, status, settlement, maturity,
-                              facility_type, security_type, property_value, {"loan_ranking": loan_ranking},
+                              facility_type, security_type, property_value,
+                              {"loan_ranking": loan_ranking, "interest_treatment": "Serviced",
+                               "interest_advance_months": 1, "investor_target_irr": 8.0},
                               initial_facility_name.strip() or "Facility 1")
                     st.success(f"Created deal: {deal_name.strip()}")
                     st.rerun()
@@ -2017,7 +2149,8 @@ def page_deals():
                         new_id = save_additional_facility(root_id, new_facility_name.strip(),
                             new_facility_amount, new_status, new_settlement, new_maturity,
                             new_facility_type, new_security, new_property_value,
-                            {"loan_ranking": new_ranking})
+                            {"loan_ranking": new_ranking, "interest_treatment": "Serviced",
+                             "interest_advance_months": 1, "investor_target_irr": 8.0})
                         st.success(f"Added facility {new_facility_name.strip()} (ID {new_id}).")
                         st.rerun()
 
@@ -2054,6 +2187,16 @@ def page_modeler():
     existing_params = safe_json(deal_row.get("params_json", "{}"), {})
     ensure_default_deal_investors(deal_id)
     deal_investors_df = load_deal_investors(deal_id)
+    legacy_target_values = (pd.to_numeric(deal_investors_df.get("target_irr", pd.Series(dtype=float)),
+        errors="coerce").dropna() if not deal_investors_df.empty else pd.Series(dtype=float))
+    legacy_shared_target = float(legacy_target_values.mean()) if not legacy_target_values.empty else 8.0
+    try:
+        investor_target_default = float(existing_params.get("investor_target_irr", legacy_shared_target))
+        if not np.isfinite(investor_target_default):
+            investor_target_default = legacy_shared_target
+    except (TypeError, ValueError):
+        investor_target_default = legacy_shared_target
+    investor_target_default = max(0.0, min(50.0, investor_target_default))
     investor_transactions_df = load_investor_transactions(deal_id)
     actual_capital_calls = capital_calls_by_date(investor_transactions_df)
 
@@ -2107,6 +2250,16 @@ def page_modeler():
             c6.metric("Maturity anniversary", maturity_date.strftime("%d %b %Y"))
             st.caption("Each payment date is generated from the settlement-date anniversary. Month-end dates are preserved (for example, 31 January → 28 February → 31 March).")
 
+            treatment_default = str(existing_params.get("interest_treatment", "Serviced"))
+            if treatment_default.strip().lower() in ["capitalised", "capitalized"]:
+                treatment_default = "Capitalised"
+            else:
+                treatment_default = "Serviced"
+            init_widget_state(prefix + "interest_treatment", treatment_default)
+            interest_treatment = st.selectbox("Interest treatment", ["Serviced", "Capitalised"],
+                key=prefix + "interest_treatment",
+                help="Serviced interest is billed in advance. Capitalised interest accrues on ACT/365 and is added to principal, with no cash interest due.")
+
             stored_advance = existing_params.get("interest_advance_months", 1)
             all_advance_default = str(stored_advance).strip().lower() == "all"
             try:
@@ -2117,15 +2270,23 @@ def page_modeler():
             init_widget_state(prefix + "interest_advance_all", all_advance_default)
             init_widget_state(prefix + "interest_advance_months", advance_months_default)
             adv1, adv2 = st.columns([1, 2])
-            interest_advance_all = adv1.checkbox("All-term interest charged at settlement",
-                key=prefix + "interest_advance_all")
+            interest_advance_all = adv1.checkbox("All serviced interest for the full term in advance",
+                key=prefix + "interest_advance_all", disabled=interest_treatment == "Capitalised")
             if st.session_state[prefix + "interest_advance_months"] > int(term_months):
                 st.session_state[prefix + "interest_advance_months"] = int(term_months)
             interest_advance_months = adv2.number_input("Initial months’ interest in advance",
                 min_value=1, max_value=int(term_months), step=1,
-                key=prefix + "interest_advance_months", disabled=interest_advance_all,
-                help="Always at least one month in advance. After this initial coverage, interest is billed one month in advance each month.")
+                key=prefix + "interest_advance_months",
+                disabled=interest_advance_all or interest_treatment == "Capitalised",
+                help="Applies only to Serviced interest. After this initial coverage, interest is billed one month in advance each month.")
             interest_advance_setting = "All" if interest_advance_all else int(interest_advance_months)
+            net_advance_interest_from_proceeds = (interest_treatment == "Serviced"
+                and str(interest_advance_setting).strip().lower() == "all"
+                and facility_type.strip().lower() in ["bridging", "residual stock"])
+            if interest_treatment == "Capitalised":
+                st.caption("Capitalised interest accrues using actual days, is added to principal, and has no cash interest due. The advance setting above is not applied.")
+            else:
+                st.caption("The advance-month setting applies only to Serviced interest.")
 
             construction_default = int(existing_params.get("construction_months", min(6, int(term_months))))
             construction_default = max(0, min(int(term_months), construction_default))
@@ -2168,9 +2329,16 @@ def page_modeler():
                 st.info("Senior default: BPCFMC 50% · BPCFLC 15% · CBCF 35%. Optional investors are 0% until you allocate them on a row.")
             else:
                 st.info("Mezzanine default: BPCFMC 80% · BPCFLC 20%. CBCF is not included by default; optional investors can be attached and allocated when needed.")
+            init_widget_state(prefix + "investor_target_irr", investor_target_default)
+            investor_target_irr = st.number_input("Shared investor target return (% p.a.)",
+                min_value=0.0, max_value=50.0, step=0.25,
+                key=prefix + "investor_target_irr",
+                help="One return assumption applies to every investor attached to this facility/tranche. Set a different rate on another facility if needed.")
+            st.caption("This is a facility-level assumption shared by all investors attached to this tranche; it is not an individual investor rate.")
             if not deal_investors_df.empty:
-                inv_view = deal_investors_df[["name", "investor_type", "target_irr"]].rename(columns={
-                    "name": "Investor", "investor_type": "Type", "target_irr": "Target XIRR (%)"})
+                inv_view = deal_investors_df[["name", "investor_type", "senior_default_pct", "mezz_default_pct"]].rename(columns={
+                    "name": "Investor", "investor_type": "Type",
+                    "senior_default_pct": "Senior default (%)", "mezz_default_pct": "Mezzanine default (%)"})
                 st.dataframe(inv_view, use_container_width=True, hide_index=True)
             st.caption("Attach or remove optional investors (for example, CBFM or Syndicate) in the Investor Portal. Their allocation columns will then appear in the drawdown plan.")
 
@@ -2220,7 +2388,9 @@ def page_modeler():
         "facility_amount": float(facility_amount), "facility_type": facility_type,
         "property_value": float(property_value), "settlement_date": settlement.isoformat(),
         "maturity_date": maturity_date.isoformat(), "term_months": int(term_months),
+        "interest_treatment": interest_treatment,
         "interest_advance_months": interest_advance_setting,
+        "investor_target_irr": float(investor_target_irr),
         "construction_months": int(construction_months), "borrower_irr": float(borrower_irr),
         "cpr": float(cpr), "drawdown_profile": drawdown_profile,
         "s_curve_steepness": float(s_curve_steepness), "loan_ranking": loan_ranking,
@@ -2265,6 +2435,8 @@ def page_modeler():
         st.markdown(f'<div class="section-note">{profile_description} {standard_text} Optional investors are included only when attached to this deal. Choose Standard, Investor Ledger or Manual for each row. Manual allocations are editable dollar amounts and should reconcile to the net amount to allocate.</div>',
                     unsafe_allow_html=True)
         st.caption("Investor Ledger rows use Capital Call movements recorded in the Investor Portal. Forecast rows default to the Senior/Mezz split. Choose Manual to override a row; the model checks each row against the net funding amount after upfront fee netting.")
+        if net_advance_interest_from_proceeds:
+            st.info("For this all-term Serviced Bridging / Residual Stock facility, investor funding remains gross draw less upfront fees. Prepaid interest is withheld separately from the borrower’s initial proceeds in the Loan Schedule.")
 
         reset_clicked = st.button("Reset to suggested schedule", key=prefix + "reset_drawdown_button")
         if reset_clicked:
@@ -2383,9 +2555,10 @@ def page_modeler():
             st.plotly_chart(fig, use_container_width=True)
         with b:
             st.markdown("#### Income mix")
+            recognized_interest = float(schedule_df["Interest_Due"].sum()
+                + schedule_df["Capitalised_Interest"].sum() + schedule_df["Penalty_Interest"].sum())
             income_data = pd.DataFrame({"Type": ["Interest", "Fees", "Investor cost", "Net revenue"],
-                "Amount": [float(schedule_df["Interest_Due"].sum() + schedule_df["Penalty_Interest"].sum()),
-                    float(pnl["Total Income"] - schedule_df["Interest_Due"].sum() - schedule_df["Penalty_Interest"].sum()),
+                "Amount": [recognized_interest, float(pnl["Total Income"] - recognized_interest),
                     float(pnl["Investor Interest Expense"]), float(pnl["Net Revenue"])]})
             fig = px.bar(income_data, x="Type", y="Amount", color="Type",
                          color_discrete_sequence=["#4778b8", "#43a581", "#d96b68", "#6b83c4"])
@@ -2402,20 +2575,31 @@ def page_modeler():
             st.markdown(f'<div class="breach-alert">Covenant breach projected on: {breach_dates}</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="covenant-ok">All projected LVRs are within the selected covenant.</div>', unsafe_allow_html=True)
+        if interest_treatment == "Capitalised":
+            st.caption("Capitalised interest accrues on ACT/365 and is added to principal; it is not shown as cash interest due.")
+        elif net_advance_interest_from_proceeds:
+            st.caption("All-term serviced interest for this Bridging / Residual Stock facility is withheld from the initial proceeds. It is shown separately from cash interest due and is not charged again on the settlement date.")
 
         display_cols = ["Drawdown_Date", "Payment_Date", "Drawdown_Gross", "Upfront_Fees_Deducted",
-            "Drawdown_Net", "Opening_Balance", "Balance_After_Draw", "Interest_Due", "Penalty_Interest",
-            "Line_Fee", "Admin_Fee", "Discharge_Fee", "Scheduled_Principal", "Prepayment",
-            "Contract_Principal_Due", "Actual_Interest", "Actual_Principal", "Actual_Fees", "Total_Due",
+            "Advance_Interest_Withheld", "Investor_Funding", "Drawdown_Net", "Opening_Balance",
+            "Balance_After_Draw", "Capitalised_Interest", "Balance_After_Capitalisation",
+            "Interest_Due", "Cash_Interest_Advance", "Penalty_Interest", "Line_Fee", "Admin_Fee", "Discharge_Fee",
+            "Scheduled_Principal", "Prepayment", "Maturity_Repayment", "Contract_Principal_Due",
+            "Actual_Interest", "Actual_Principal", "Actual_Fees", "Total_Due",
             "Arrears", "Principal_Applied", "Ending_Balance", "Property_Value", "LVR_pct", "Covenant_Breach"]
         display = schedule_df[display_cols].rename(columns={
             "Drawdown_Date": "Drawdown Date", "Payment_Date": "Payment Date",
             "Drawdown_Gross": "Gross Drawdown", "Upfront_Fees_Deducted": "Upfront Fees Netted",
-            "Drawdown_Net": "Net Drawdown", "Opening_Balance": "Opening Balance",
-            "Balance_After_Draw": "Balance After Draw", "Interest_Due": "Interest Due",
+            "Advance_Interest_Withheld": "Advance Interest Withheld",
+            "Investor_Funding": "Investor Funding", "Drawdown_Net": "Net Drawdown",
+            "Opening_Balance": "Opening Balance", "Balance_After_Draw": "Balance After Draw",
+            "Capitalised_Interest": "Capitalised Interest",
+            "Balance_After_Capitalisation": "Balance After Capitalisation",
+            "Interest_Due": "Interest Assessed", "Cash_Interest_Advance": "Cash Interest Advance",
             "Penalty_Interest": "Penalty Interest", "Line_Fee": "Line Fee", "Admin_Fee": "Admin Fee",
             "Discharge_Fee": "Discharge Fee", "Scheduled_Principal": "Scheduled Principal",
-            "Prepayment": "Prepayment", "Contract_Principal_Due": "Contract Principal Due",
+            "Prepayment": "Prepayment", "Maturity_Repayment": "Maturity Repayment",
+            "Contract_Principal_Due": "Contract Principal Due",
             "Actual_Interest": "Actual Interest", "Actual_Principal": "Actual Principal",
             "Actual_Fees": "Actual Fees", "Total_Due": "Total Due", "Arrears": "Arrears",
             "Principal_Applied": "Principal Applied", "Ending_Balance": "Ending Balance",
@@ -2461,6 +2645,10 @@ def page_modeler():
         existing_override = bool(existing_actual.get("drawdown_override", False))
         existing_payment_log = bool(existing_actual.get("payment_actuals_logged", False))
         st.write(f"Draw period starts **{selected_row['Drawdown_Date'].strftime('%d %b %Y')}** · scheduled due **{money(selected_row['Total_Due'])}** · planned draw **{money(selected_row['Planned_Drawdown'])}**")
+        if interest_treatment == "Capitalised":
+            st.info("Capitalised interest is added to principal on ACT/365; no cash interest is due for this facility.")
+        elif float(selected_row.get("Advance_Interest_Withheld", 0.0) or 0.0) > 0:
+            st.info(f"{money(selected_row['Advance_Interest_Withheld'])} of advance interest was withheld from initial proceeds and is not included again in scheduled cash due.")
 
         with st.form(prefix + "actuals_form"):
             override_key = prefix + "actual_override_" + selected_payment_date.isoformat()
@@ -2481,7 +2669,8 @@ def page_modeler():
             record_payments = st.checkbox("Record actual collections for this payment date", key=record_key)
             c1, c2, c3 = st.columns(3)
             actual_interest = c1.number_input("Actual interest received", min_value=0.0,
-                max_value=1_000_000_000.0, step=100.0, key=interest_key, disabled=not record_payments)
+                max_value=1_000_000_000.0, step=100.0, key=interest_key,
+                disabled=(not record_payments or interest_treatment == "Capitalised"))
             actual_principal = c2.number_input("Actual principal received", min_value=0.0,
                 max_value=1_000_000_000.0, step=100.0, key=principal_key, disabled=not record_payments)
             actual_fees = c3.number_input("Actual fees received", min_value=0.0,
@@ -2514,6 +2703,7 @@ def page_modeler():
     # ── Investor ledger ─────────────────────────────────────────
     with tabs[5]:
         st.subheader("Investor base and returns")
+        st.caption(f"Shared investor target return for this facility/tranche: {investor_target_irr:.2f}% p.a.")
         st.info("Standard rows use the deal ranking: Senior 50% / 15% / 35% (BPCFMC / BPCFLC / CBCF), or Mezzanine 80% / 20% (BPCFMC / BPCFLC). Investor Ledger and Manual rows use their recorded/entered splits. Buyouts and actual repayments are applied from Investor Portal transactions.")
         summary_format = {"Total_Funded": "${:,.0f}", "Total_Interest_Earned": "${:,.0f}",
             "Total_Principal_Returned": "${:,.0f}", "Outstanding_Balance": "${:,.0f}",
@@ -2842,17 +3032,16 @@ def page_investor_portal():
         st.subheader("Investor register")
         with st.expander("＋ Add investor", expanded=False):
             with st.form("add_investor_form"):
-                c1, c2, c3 = st.columns(3)
+                c1, c2 = st.columns(2)
                 investor_name = c1.text_input("Investor name *")
                 investor_type = c2.selectbox("Investor type", ["Fund", "CBFM", "Syndicate", "Institutional", "Individual", "Other"])
-                investor_target = c3.number_input("Target XIRR (% p.a.)", min_value=0.0, max_value=50.0, value=8.0, step=0.25)
                 investor_notes = st.text_input("Notes")
                 if st.form_submit_button("Save investor", type="primary"):
                     if not investor_name.strip():
                         st.error("Investor name is required.")
                     else:
                         try:
-                            save_investor(investor_name, investor_type, investor_target, investor_notes)
+                            save_investor(investor_name, investor_type, 8.0, investor_notes)
                             st.success(f"Added {investor_name.strip()}.")
                             st.rerun()
                         except sqlite3.IntegrityError:
@@ -2861,8 +3050,8 @@ def page_investor_portal():
         if investors.empty:
             st.info("No investors found.")
         else:
-            st.dataframe(investors[["id", "name", "investor_type", "target_irr", "status", "notes"]].rename(columns={
-                "id": "ID", "name": "Investor", "investor_type": "Type", "target_irr": "Target XIRR (%)",
+            st.dataframe(investors[["id", "name", "investor_type", "status", "notes"]].rename(columns={
+                "id": "ID", "name": "Investor", "investor_type": "Type",
                 "status": "Status", "notes": "Notes"}), use_container_width=True, hide_index=True)
             manage_id = st.selectbox("Manage investor", investors["id"].astype(int).tolist(),
                 format_func=lambda value: f"{investors.loc[investors.id == int(value), 'name'].iloc[0]} · ID {int(value)}",
@@ -2873,15 +3062,12 @@ def page_investor_portal():
             if str(manage_row["investor_type"]) not in type_options:
                 type_options.append(str(manage_row["investor_type"]))
             with st.form(f"edit_investor_form_{int(manage_id)}"):
-                ec1, ec2, ec3 = st.columns(3)
+                ec1, ec2 = st.columns(2)
                 edited_name = ec1.text_input("Investor name", value=str(manage_row["name"]),
                     disabled=is_core, key=f"edit_investor_name_{int(manage_id)}")
                 edited_type = ec2.selectbox("Investor type", type_options,
                     index=type_options.index(str(manage_row["investor_type"])),
                     key=f"edit_investor_type_{int(manage_id)}")
-                edited_target = ec3.number_input("Target XIRR (% p.a.)", min_value=0.0, max_value=50.0,
-                    value=float(manage_row["target_irr"] or 8.0), step=0.25,
-                    key=f"edit_investor_target_{int(manage_id)}")
                 status_options = ["Active", "Inactive"]
                 current_status = str(manage_row["status"] or "Active")
                 if current_status not in status_options:
@@ -2896,7 +3082,8 @@ def page_investor_portal():
                         st.error("Investor name is required.")
                     else:
                         try:
-                            update_investor(manage_id, edited_name, edited_type, edited_target,
+                            update_investor(manage_id, edited_name, edited_type,
+                                            float(manage_row["target_irr"] or 8.0),
                                             edited_status, edited_notes)
                             st.success("Investor details updated.")
                             st.rerun()
@@ -2933,34 +3120,20 @@ def page_investor_portal():
             st.session_state[assignment_key] = current_ids
         selected_ids = st.multiselect("Investors attached to this facility", list(investor_labels.keys()),
             key=assignment_key, format_func=lambda value: investor_labels.get(int(value), str(value)))
-        st.caption("An investor is one global entity; each facility can carry its own participation and target XIRR.")
-        current_targets = {int(row["id"]): float(row["target_irr"] or 8.0)
-                           for _, row in current_assignment.iterrows()}
-        global_targets = {int(row["id"]): float(row["target_irr"] or 8.0)
-                          for _, row in active_investors.iterrows()}
-        target_rows = [{"Investor ID": int(value), "Investor": investor_labels.get(int(value), str(value)),
-                        "Target XIRR (%)": current_targets.get(int(value), global_targets.get(int(value), 8.0))}
-                       for value in selected_ids]
-        target_matrix = pd.DataFrame(target_rows, columns=["Investor ID", "Investor", "Target XIRR (%)"])
-        target_key = f"facility_target_returns_{assignment_deal_id}_{hashlib.sha1(str(sorted(map(int, selected_ids))).encode()).hexdigest()[:8]}"
-        edited_targets = st.data_editor(target_matrix, key=target_key, hide_index=True,
-            use_container_width=True, num_rows="fixed", column_config={
-                "Investor ID": st.column_config.NumberColumn("Investor ID", disabled=True),
-                "Investor": st.column_config.TextColumn("Investor", disabled=True),
-                "Target XIRR (%)": st.column_config.NumberColumn("Target XIRR (%)", min_value=0.0,
-                    max_value=50.0, step=0.25, format="%.2f", required=True),
-            })
-        target_returns = {int(row["Investor ID"]): float(row["Target XIRR (%)"])
-                          for _, row in edited_targets.iterrows()}
-        if st.button("Save facility investor assignments and returns", type="primary",
+        st.caption("Investor returns are set once per facility/tranche in Deal Workspace and shared by all investors attached to it.")
+        assignment_deal = deals[deals["id"] == assignment_deal_id].iloc[0]
+        assignment_params = safe_json(assignment_deal.get("params_json", "{}"), {})
+        if "investor_target_irr" in assignment_params:
+            st.info(f"Shared facility target return: {float(assignment_params['investor_target_irr']):.2f}% p.a. · edit in Deal Workspace → Returns & Allocation.")
+        if st.button("Save facility investor assignments", type="primary",
                      key=f"save_assignments_{assignment_deal_id}"):
-            save_deal_investors(assignment_deal_id, selected_ids, target_returns)
-            st.success("Facility investors and their target XIRRs were saved.")
+            save_deal_investors(assignment_deal_id, selected_ids)
+            st.success("Facility investor assignments were saved.")
             st.rerun()
         if not current_assignment.empty:
-            assignment_view = current_assignment[["name", "investor_type", "target_irr", "senior_default_pct", "mezz_default_pct"]].rename(columns={
-                "name": "Investor", "investor_type": "Type", "target_irr": "Target XIRR (%)",
-                "senior_default_pct": "Senior default (%)", "mezz_default_pct": "Mezz default (%)"})
+            assignment_view = current_assignment[["name", "investor_type", "senior_default_pct", "mezz_default_pct"]].rename(columns={
+                "name": "Investor", "investor_type": "Type",
+                "senior_default_pct": "Senior default (%)", "mezz_default_pct": "Mezzanine default (%)"})
             st.dataframe(assignment_view, use_container_width=True, hide_index=True)
 
     # Record actual movements; buyouts are entered as a single total with a user-defined seller split.
