@@ -148,6 +148,37 @@ def init_db():
         actual_interest REAL DEFAULT 0, actual_principal REAL DEFAULT 0,
         actual_fees REAL DEFAULT 0,
         FOREIGN KEY (deal_id) REFERENCES deals(id))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS investors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+        investor_type TEXT DEFAULT 'Fund', target_irr REAL DEFAULT 8.0,
+        status TEXT DEFAULT 'Active', notes TEXT DEFAULT '')""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS deal_investors (
+        deal_id INTEGER NOT NULL, investor_id INTEGER NOT NULL,
+        senior_default_pct REAL DEFAULT 0, mezz_default_pct REAL DEFAULT 0,
+        is_active INTEGER DEFAULT 1,
+        PRIMARY KEY (deal_id, investor_id),
+        FOREIGN KEY (deal_id) REFERENCES deals(id),
+        FOREIGN KEY (investor_id) REFERENCES investors(id))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS investor_transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, deal_id INTEGER NOT NULL,
+        transaction_date TEXT NOT NULL, transaction_type TEXT NOT NULL,
+        investor_id INTEGER NOT NULL, counterparty_id INTEGER,
+        amount REAL NOT NULL, notes TEXT DEFAULT '', source TEXT DEFAULT 'User',
+        FOREIGN KEY (deal_id) REFERENCES deals(id),
+        FOREIGN KEY (investor_id) REFERENCES investors(id),
+        FOREIGN KEY (counterparty_id) REFERENCES investors(id))""")
+
+    investor_cols = {row[1] for row in conn.execute("PRAGMA table_info(investors)").fetchall()}
+    if "target_irr" not in investor_cols:
+        conn.execute("ALTER TABLE investors ADD COLUMN target_irr REAL DEFAULT 8.0")
+    transaction_cols = {row[1] for row in conn.execute("PRAGMA table_info(investor_transactions)").fetchall()}
+    if "source" not in transaction_cols:
+        conn.execute("ALTER TABLE investor_transactions ADD COLUMN source TEXT DEFAULT 'User'")
+
+    # The three core pools are available on every deal. Optional investors such as
+    # CBFM or Syndicate are added in the Investor Portal and attached deal-by-deal.
+    for core_name in ("BPCFMC", "BPCFLC", "CBCF"):
+        conn.execute("INSERT OR IGNORE INTO investors (name, investor_type, target_irr) VALUES (?, 'Fund', 8.0)", (core_name,))
 
     # Backwards-compatible migration from the earlier month-number actuals table.
     actual_cols = {row[1] for row in conn.execute("PRAGMA table_info(actuals)").fetchall()}
@@ -272,12 +303,142 @@ def migrate_drawdown_plan(raw_schedule, settlement, term, template_df):
                 # Legacy Month 1 was the first draw period, beginning on settlement.
                 month_num = int(key)
                 target = add_months(settlement, max(month_num - 1, 0))
+            if isinstance(value, dict):
+                value = value.get("gross_draw", value.get("amount", 0.0))
             if target.isoformat() in amounts:
                 amounts[target.isoformat()] = max(0.0, float(value))
         except (TypeError, ValueError):
             continue
     plan["Drawdown Amount"] = [amounts.get(value.isoformat(), 0.0) for value in dates]
     return plan
+
+
+def allocation_column(investor_name):
+    return f"{investor_name} allocation"
+
+
+def default_allocation_amounts(net_amount, loan_ranking, investor_names):
+    return {name: max(0.0, float(net_amount)) * standard_split_for(name, loan_ranking) / 100.0
+            for name in investor_names}
+
+
+def saved_drawdown_rows(raw_schedule, settlement):
+    raw = safe_json(raw_schedule, {})
+    result = {}
+    if not isinstance(raw, dict):
+        return result
+    for key, value in raw.items():
+        try:
+            draw_date = parse_date(key)
+            if draw_date is None:
+                draw_date = add_months(settlement, max(int(key) - 1, 0))
+            result[draw_date.isoformat()] = value
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def build_drawdown_matrix(template_df, raw_schedule, actual_calls, investor_names,
+                          loan_ranking, upfront_total, settlement, use_template=False):
+    saved = {} if use_template else saved_drawdown_rows(raw_schedule, settlement)
+    rows = []
+    for _, template_row in template_df.iterrows():
+        draw_date = parse_date(template_row["Drawdown Date"])
+        key = draw_date.isoformat()
+        prior = saved.get(key)
+        if isinstance(prior, dict):
+            gross = max(0.0, float(prior.get("gross_draw", prior.get("amount", template_row["Drawdown Amount"])) or 0))
+            source = str(prior.get("allocation_source", "Standard"))
+            status = str(prior.get("status", "Forecast"))
+            prior_allocations = prior.get("allocations", {}) or {}
+        elif prior is not None:
+            gross = max(0.0, float(prior or 0))
+            source = "Standard"
+            status = "Forecast"
+            prior_allocations = {}
+        else:
+            gross = max(0.0, float(template_row["Drawdown Amount"]))
+            source = "Standard"
+            status = "Forecast"
+            prior_allocations = {}
+
+        if key in actual_calls and (prior is None or source != "Manual"):
+            source = "Investor Ledger"
+            status = "Actual"
+        if source not in ["Standard", "Investor Ledger", "Manual"]:
+            source = "Standard"
+        if status not in ["Forecast", "Actual"]:
+            status = "Forecast"
+        rows.append({"Drawdown Date": draw_date, "Status": status, "Allocation Source": source,
+                     "Gross Drawdown": gross, "_prior_allocations": prior_allocations})
+
+    first_draw_index = next((i for i, row in enumerate(rows) if row["Gross Drawdown"] > 0), None)
+    for index, row in enumerate(rows):
+        upfront = min(float(upfront_total), row["Gross Drawdown"]) if index == first_draw_index else 0.0
+        net_to_allocate = max(0.0, row["Gross Drawdown"] - upfront)
+        key = row["Drawdown Date"].isoformat()
+        if row["Allocation Source"] == "Standard":
+            allocations = default_allocation_amounts(net_to_allocate, loan_ranking, investor_names)
+        elif row["Allocation Source"] == "Investor Ledger":
+            allocations = {name: float(actual_calls.get(key, {}).get(name, 0.0)) for name in investor_names}
+        else:
+            allocations = {name: float(row["_prior_allocations"].get(name, 0.0) or 0.0)
+                           for name in investor_names}
+            if not any(allocations.values()) and key in actual_calls:
+                allocations = {name: float(actual_calls[key].get(name, 0.0)) for name in investor_names}
+        for name in investor_names:
+            row[allocation_column(name)] = max(0.0, allocations.get(name, 0.0))
+        row["_net_to_allocate"] = net_to_allocate
+        row["_prior_allocations"] = None
+    return pd.DataFrame(rows)
+
+
+def effective_drawdown_plan(edited_plan, investor_names, actual_calls, loan_ranking,
+                            upfront_total):
+    result = {}
+    display_rows = []
+    first_draw_index = None
+    gross_values = []
+    for _, row in edited_plan.iterrows():
+        try:
+            gross = max(0.0, float(row.get("Gross Drawdown", 0) or 0))
+        except (TypeError, ValueError):
+            gross = 0.0
+        gross_values.append(gross)
+    first_draw_index = next((i for i, gross in enumerate(gross_values) if gross > 0), None)
+
+    for index, (_, row) in enumerate(edited_plan.iterrows()):
+        draw_date = parse_date(row.get("Drawdown Date"))
+        if draw_date is None:
+            continue
+        key = draw_date.isoformat()
+        gross = gross_values[index]
+        upfront = min(float(upfront_total), gross) if index == first_draw_index else 0.0
+        net_to_allocate = max(0.0, gross - upfront)
+        source = str(row.get("Allocation Source", "Standard"))
+        status = str(row.get("Status", "Forecast"))
+        if source == "Standard":
+            allocations = default_allocation_amounts(net_to_allocate, loan_ranking, investor_names)
+        elif source == "Investor Ledger":
+            allocations = {name: float(actual_calls.get(key, {}).get(name, 0.0)) for name in investor_names}
+        else:
+            allocations = {}
+            for name in investor_names:
+                try:
+                    allocations[name] = max(0.0, float(row.get(allocation_column(name), 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    allocations[name] = 0.0
+        allocated = sum(allocations.values())
+        result[key] = {"gross_draw": gross, "status": status,
+            "allocation_source": source, "allocations": allocations}
+        summary = {"Drawdown Date": draw_date, "Status": status, "Allocation Source": source,
+            "Gross Drawdown": gross, "Upfront Fees Netted": upfront,
+            "Net Amount to Allocate": net_to_allocate}
+        for name in investor_names:
+            summary[name] = allocations.get(name, 0.0)
+        summary["Allocation Difference"] = net_to_allocate - allocated
+        display_rows.append(summary)
+    return result, pd.DataFrame(display_rows)
 
 
 def compute_fees(params):
@@ -347,7 +508,17 @@ def build_schedule(params, actuals_map, drawdown_map):
         payment_date = add_months(settlement, index + 1)
         days = max((payment_date - draw_date).days, 1)
         actual = actuals_map.get(payment_date.isoformat(), {})
-        planned_draw = max(0.0, float(drawdown_map.get(draw_date.isoformat(), 0.0)))
+        plan_item = drawdown_map.get(draw_date.isoformat(), {})
+        if isinstance(plan_item, dict):
+            planned_draw = max(0.0, float(plan_item.get("gross_draw", plan_item.get("amount", 0.0))))
+            investor_allocations = dict(plan_item.get("allocations", {}))
+            allocation_source = str(plan_item.get("allocation_source", "Standard"))
+            drawdown_status = str(plan_item.get("status", "Forecast"))
+        else:  # Support old month/date -> amount schedule maps.
+            planned_draw = max(0.0, float(plan_item or 0.0))
+            investor_allocations = {}
+            allocation_source = "Standard"
+            drawdown_status = "Forecast"
         if actual.get("drawdown_override", False):
             gross_draw = max(0.0, float(actual.get("actual_drawdown", 0.0)))
         else:
@@ -418,6 +589,9 @@ def build_schedule(params, actuals_map, drawdown_map):
             "Payment_Date": payment_date,
             "Period_Days": days,
             "Planned_Drawdown": planned_draw,
+            "Allocation_Source": allocation_source,
+            "Drawdown_Status": drawdown_status,
+            "Investor_Allocations": investor_allocations,
             "Drawdown_Gross": gross_draw,
             "Upfront_Fees_Deducted": upfront_deducted,
             "Drawdown_Net": net_draw,
@@ -455,118 +629,253 @@ def build_schedule(params, actuals_map, drawdown_map):
 # ═══════════════════════════════════════════════════════════════
 # INVESTOR ALLOCATION & LEDGER
 # ═══════════════════════════════════════════════════════════════
-FUND_NAMES = ["BPCFMC", "BPCFLC", "CBCF"]
-FUND_RATIOS = {"BPCFMC": 0.50, "BPCFLC": 0.15, "CBCF": 0.35}
+def build_investor_ledger(schedule_df, params, investors_df, transactions_df=None):
+    """Build projected investor economics, applying actual movements on their transaction dates."""
+    transactions_df = transactions_df if transactions_df is not None else pd.DataFrame()
+    investor_names = investors_df["name"].astype(str).tolist() if not investors_df.empty else []
+    target_rates = {str(row["name"]): float(row.get("target_irr", 8.0)) / 100.0
+                    for _, row in investors_df.iterrows()}
 
+    # Keep historical transaction counterparties and any legacy allocation names visible.
+    if not transactions_df.empty:
+        for column in ["investor_name", "counterparty_name"]:
+            if column in transactions_df:
+                for name in transactions_df[column].dropna().astype(str).tolist():
+                    if name and name.lower() != "nan" and name not in investor_names:
+                        investor_names.append(name)
+    scheduled_draw_dates = set()
+    if not schedule_df.empty:
+        for _, schedule_row in schedule_df.iterrows():
+            scheduled_draw_dates.add(parse_date(schedule_row.get("Drawdown_Date")).isoformat())
+            raw = schedule_row.get("Investor_Allocations", {})
+            if isinstance(raw, str):
+                raw = safe_json(raw, {})
+            if isinstance(raw, dict):
+                for name in raw:
+                    if str(name) not in investor_names:
+                        investor_names.append(str(name))
+    for name in investor_names:
+        target_rates.setdefault(name, 0.08)
 
-def build_investor_ledger(schedule_df, params):
-    fund_rate = float(params.get("fund_target_irr", 8.0)) / 100.0
-    cbfm_rate = float(params.get("cbfm_target_irr", 10.0)) / 100.0
-    syndicate_rate = float(params.get("syndicate_target_irr", 12.0)) / 100.0
-    cbfm_allocation = max(0.0, float(params.get("cbfm_alloc_pct", 0.0)) / 100.0)
-    syndicate_allocation = max(0.0, float(params.get("syndicate_alloc_pct", 0.0)) / 100.0)
-
-    investor_names = FUND_NAMES.copy()
-    if cbfm_allocation > 0:
-        investor_names.append("CBFM")
-    if syndicate_allocation > 0:
-        investor_names.append("Syndicate")
-
-    rates = {name: fund_rate for name in FUND_NAMES}
-    rates["CBFM"] = cbfm_rate
-    rates["Syndicate"] = syndicate_rate
     balances = {name: 0.0 for name in investor_names}
     total_funded = {name: 0.0 for name in investor_names}
     total_interest = {name: 0.0 for name in investor_names}
     total_principal_returned = {name: 0.0 for name in investor_names}
     cashflows = {name: [] for name in investor_names}
-    rows = []
-    first_draw_done = False
+    cashflow_events = []
+    period_events = [[] for _ in range(len(schedule_df))]
+    loan_ranking = str(params.get("loan_ranking", "Senior"))
 
-    for _, schedule_row in schedule_df.iterrows():
+    def record_flow(name, flow_date, flow_type, amount, signed_amount):
+        amount = max(0.0, float(amount))
+        if amount <= 0:
+            return
+        cashflows.setdefault(name, []).append((flow_date, float(signed_amount)))
+        cashflow_events.append({"Date": flow_date, "Investor": name, "Flow_Type": flow_type,
+                                "Amount": amount, "Signed_Cashflow": float(signed_amount)})
+
+    # Allocate each portal transaction to one settlement-anniversary interval. Boundary-date
+    # movements belong to the period ending on that date (except the first settlement date).
+    if not transactions_df.empty and not schedule_df.empty:
+        for _, tx in transactions_df.iterrows():
+            if str(tx.get("source", "User")) == "Drawdown Plan":
+                continue  # Already represented by the saved per-draw allocation row.
+            tx_type = str(tx.get("transaction_type", ""))
+            tx_date = parse_date(tx.get("transaction_date"))
+            if tx_date is None:
+                continue
+            if tx_type == "Capital Call" and tx_date.isoformat() in scheduled_draw_dates:
+                continue  # The drawdown row (Investor Ledger or Manual) is the row-level source of truth.
+            investor_name = str(tx.get("investor_name", ""))
+            counterparty = tx.get("counterparty_name")
+            counterparty = str(counterparty) if pd.notna(counterparty) else ""
+            amount = max(0.0, float(tx.get("amount", 0.0) or 0.0))
+            if not investor_name or investor_name.lower() == "nan" or amount <= 0:
+                continue
+            if tx_type not in ["Capital Call", "Principal Repayment", "Interest Distribution",
+                               "Buyout", "Other Increase", "Other Decrease"]:
+                continue
+            for period_index, (_, schedule_row) in enumerate(schedule_df.iterrows()):
+                draw_date = parse_date(schedule_row["Drawdown_Date"])
+                payment_date = parse_date(schedule_row["Payment_Date"])
+                in_period = (draw_date < tx_date <= payment_date)
+                if period_index == 0 and tx_date == draw_date:
+                    in_period = True
+                if in_period:
+                    event_order = {"Interest Distribution": 0, "Capital Call": 1, "Other Increase": 2,
+                                   "Principal Repayment": 3, "Other Decrease": 4, "Buyout": 5}
+                    period_events[period_index].append((tx_date, event_order[tx_type], tx_type,
+                        investor_name, counterparty, amount))
+                    break
+
+    rows = []
+    for period_index, (_, schedule_row) in enumerate(schedule_df.iterrows()):
         draw_date = parse_date(schedule_row["Drawdown_Date"])
         payment_date = parse_date(schedule_row["Payment_Date"])
-        days = int(schedule_row["Period_Days"])
         net_draw = float(schedule_row["Drawdown_Net"])
-        principal_due = min(float(schedule_row["Principal_Applied"]), sum(balances.values()))
-        allocations = {name: 0.0 for name in investor_names}
+        raw_allocations = schedule_row.get("Investor_Allocations", {})
+        if isinstance(raw_allocations, str):
+            raw_allocations = safe_json(raw_allocations, {})
+        raw_allocations = raw_allocations if isinstance(raw_allocations, dict) else {}
+        source = str(schedule_row.get("Allocation_Source", "Standard"))
+        allocations = {name: max(0.0, float(raw_allocations.get(name, 0.0) or 0.0))
+                       for name in investor_names}
+        if net_draw > 0 and source == "Standard":
+            allocations = {name: net_draw * standard_split_for(name, loan_ranking) / 100.0
+                           for name in investor_names}
 
-        if net_draw > 0:
-            if not first_draw_done:
-                for fund in FUND_NAMES:
-                    allocations[fund] = net_draw * FUND_RATIOS[fund]
-                first_draw_done = True
-            else:
-                allocation_sum = cbfm_allocation + syndicate_allocation
-                if allocation_sum > 1.0:
-                    cbfm_share = cbfm_allocation / allocation_sum
-                    syndicate_share = syndicate_allocation / allocation_sum
-                    fund_share = 0.0
-                else:
-                    cbfm_share = cbfm_allocation
-                    syndicate_share = syndicate_allocation
-                    fund_share = 1.0 - allocation_sum
-                if "CBFM" in allocations:
-                    allocations["CBFM"] = net_draw * cbfm_share
-                if "Syndicate" in allocations:
-                    allocations["Syndicate"] = net_draw * syndicate_share
-                for fund in FUND_NAMES:
-                    allocations[fund] = net_draw * fund_share * FUND_RATIOS[fund]
+        period_capital_called = {name: allocations.get(name, 0.0) for name in investor_names}
+        period_other_increase = {name: 0.0 for name in investor_names}
+        period_other_decrease = {name: 0.0 for name in investor_names}
+        period_principal_returns = {name: 0.0 for name in investor_names}
+        period_interest_actual = {name: 0.0 for name in investor_names}
+        actual_interest_names = set()
+        period_buyout_in = {name: 0.0 for name in investor_names}
+        period_buyout_out = {name: 0.0 for name in investor_names}
+        has_actual_principal = False
 
-        for name in investor_names:
-            balances[name] += allocations[name]
-            total_funded[name] += allocations[name]
-            if allocations[name] > 0:
-                cashflows[name].append((draw_date, -allocations[name]))
+        for name, amount in allocations.items():
+            balances[name] = balances.get(name, 0.0) + amount
+            total_funded[name] = total_funded.get(name, 0.0) + amount
+            if amount > 0:
+                record_flow(name, draw_date, "Capital Call", amount, -amount)
+
+        accrued_interest = {name: 0.0 for name in investor_names}
+        cursor = draw_date
+
+        def accrue_interest(until_date):
+            nonlocal cursor
+            days = max((until_date - cursor).days, 0)
+            for investor_name in list(balances):
+                accrued_interest[investor_name] = accrued_interest.get(investor_name, 0.0) + balances[investor_name] * annual_rate_for_days(
+                    target_rates.get(investor_name, 0.08), days)
+            cursor = until_date
+
+        period_events[period_index].sort(key=lambda event: (event[0], event[1]))
+        for tx_date, _, tx_type, investor_name, counterparty, amount in period_events[period_index]:
+            accrue_interest(tx_date)
+            balances.setdefault(investor_name, 0.0)
+            total_funded.setdefault(investor_name, 0.0)
+            total_interest.setdefault(investor_name, 0.0)
+            total_principal_returned.setdefault(investor_name, 0.0)
+            accrued_interest.setdefault(investor_name, 0.0)
+            period_capital_called.setdefault(investor_name, 0.0)
+            period_other_increase.setdefault(investor_name, 0.0)
+            period_other_decrease.setdefault(investor_name, 0.0)
+            period_principal_returns.setdefault(investor_name, 0.0)
+            period_interest_actual.setdefault(investor_name, 0.0)
+            period_buyout_in.setdefault(investor_name, 0.0)
+            period_buyout_out.setdefault(investor_name, 0.0)
+            if tx_type == "Capital Call":
+                balances[investor_name] += amount
+                total_funded[investor_name] += amount
+                period_capital_called[investor_name] += amount
+                record_flow(investor_name, tx_date, "Capital Call", amount, -amount)
+            elif tx_type == "Interest Distribution":
+                actual_interest_names.add(investor_name)
+                period_interest_actual[investor_name] += amount
+                record_flow(investor_name, tx_date, "Interest Distribution", amount, amount)
+            elif tx_type == "Principal Repayment":
+                has_actual_principal = True
+                returned = min(amount, max(balances[investor_name], 0.0))
+                balances[investor_name] = max(0.0, balances[investor_name] - returned)
+                period_principal_returns[investor_name] += returned
+                record_flow(investor_name, tx_date, "Principal Repayment", returned, returned)
+            elif tx_type == "Other Increase":
+                balances[investor_name] += amount
+                total_funded[investor_name] += amount
+                period_other_increase[investor_name] += amount
+                record_flow(investor_name, tx_date, "Other Increase", amount, -amount)
+            elif tx_type == "Other Decrease":
+                decreased = min(amount, max(balances[investor_name], 0.0))
+                balances[investor_name] = max(0.0, balances[investor_name] - decreased)
+                period_other_decrease[investor_name] += decreased
+                record_flow(investor_name, tx_date, "Other Decrease", decreased, decreased)
+            elif tx_type == "Buyout":
+                if not counterparty or counterparty.lower() == "nan":
+                    continue
+                balances.setdefault(counterparty, 0.0)
+                total_funded.setdefault(counterparty, 0.0)
+                total_interest.setdefault(counterparty, 0.0)
+                total_principal_returned.setdefault(counterparty, 0.0)
+                accrued_interest.setdefault(counterparty, 0.0)
+                period_buyout_in.setdefault(counterparty, 0.0)
+                period_buyout_out.setdefault(counterparty, 0.0)
+                period_capital_called.setdefault(counterparty, 0.0)
+                period_other_increase.setdefault(counterparty, 0.0)
+                period_other_decrease.setdefault(counterparty, 0.0)
+                period_principal_returns.setdefault(counterparty, 0.0)
+                period_interest_actual.setdefault(counterparty, 0.0)
+                transferred = min(amount, max(balances[investor_name], 0.0))
+                balances[investor_name] = max(0.0, balances[investor_name] - transferred)
+                balances[counterparty] += transferred
+                period_buyout_out[investor_name] += transferred
+                period_buyout_in[counterparty] += transferred
+                record_flow(investor_name, tx_date, "Buyout In", transferred, transferred)
+                record_flow(counterparty, tx_date, "Buyout Out", transferred, -transferred)
+
+        accrue_interest(payment_date)
 
         interest_by_investor = {}
-        for name in investor_names:
-            interest = balances[name] * annual_rate_for_days(rates[name], days)
+        for name in list(balances):
+            if name in actual_interest_names:
+                interest = period_interest_actual.get(name, 0.0)
+            else:
+                interest = accrued_interest.get(name, 0.0)
+                if interest > 0:
+                    record_flow(name, payment_date, "Interest Payment", interest, interest)
             interest_by_investor[name] = interest
-            total_interest[name] += interest
-            if interest > 0:
-                cashflows[name].append((payment_date, interest))
+            total_interest[name] = total_interest.get(name, 0.0) + interest
 
-        total_balance = sum(balances.values())
-        principal_returns = {name: 0.0 for name in investor_names}
-        if total_balance > 0 and principal_due > 0:
-            principal_due = min(principal_due, total_balance)
-            for name in investor_names:
-                share = balances[name] / total_balance if total_balance > 0 else 0.0
-                returned = min(balances[name], principal_due * share)
-                principal_returns[name] = returned
-                balances[name] = max(0.0, balances[name] - returned)
-                total_principal_returned[name] += returned
-                if returned > 0:
-                    cashflows[name].append((payment_date, returned))
+        if not has_actual_principal:
+            total_balance = sum(max(0.0, balance) for balance in balances.values())
+            principal_due = min(float(schedule_row.get("Principal_Applied", 0.0)), total_balance)
+            if total_balance > 0 and principal_due > 0:
+                for name in list(balances):
+                    returned = min(max(0.0, balances[name]), principal_due * max(0.0, balances[name]) / total_balance)
+                    period_principal_returns[name] = period_principal_returns.get(name, 0.0) + returned
+                    balances[name] = max(0.0, balances[name] - returned)
+                    if returned > 0:
+                        record_flow(name, payment_date, "Scheduled Principal Return", returned, returned)
 
-        for name in investor_names:
+        for name in list(balances):
+            returned = float(period_principal_returns.get(name, 0.0))
+            total_principal_returned[name] = total_principal_returned.get(name, 0.0) + returned
             rows.append({
                 "Drawdown_Date": draw_date,
                 "Payment_Date": payment_date,
                 "Investor": name,
-                "Capital_Called": allocations[name],
-                "Interest_Earned": interest_by_investor[name],
-                "Principal_Returned": principal_returns[name],
-                "Ending_Balance": balances[name],
-                "Cumulative_Funded": total_funded[name],
-                "Cumulative_Interest": total_interest[name],
+                "Capital_Called": period_capital_called.get(name, 0.0),
+                "Other_Increase": period_other_increase.get(name, 0.0),
+                "Other_Decrease": period_other_decrease.get(name, 0.0),
+                "Interest_Earned": interest_by_investor.get(name, 0.0),
+                "Principal_Returned": returned,
+                "Buyout_In": period_buyout_in.get(name, 0.0),
+                "Buyout_Out": period_buyout_out.get(name, 0.0),
+                "Ending_Balance": balances.get(name, 0.0),
+                "Cumulative_Funded": total_funded.get(name, 0.0),
+                "Cumulative_Interest": total_interest.get(name, 0.0),
             })
 
-    ledger_df = pd.DataFrame(rows)
-    target_rates = {name: rate * 100.0 for name, rate in rates.items()}
+    ledger_columns = ["Drawdown_Date", "Payment_Date", "Investor", "Capital_Called", "Other_Increase",
+        "Other_Decrease", "Interest_Earned", "Principal_Returned", "Buyout_In", "Buyout_Out",
+        "Ending_Balance", "Cumulative_Funded", "Cumulative_Interest"]
+    ledger_df = pd.DataFrame(rows, columns=ledger_columns)
     summary_rows = []
     for name in investor_names:
         summary_rows.append({
             "Investor": name,
-            "Total_Funded": total_funded[name],
-            "Total_Interest_Earned": total_interest[name],
-            "Total_Principal_Returned": total_principal_returned[name],
-            "Outstanding_Balance": balances[name],
-            "Target_XIRR": target_rates[name],
-            "Actual_XIRR": calc_xirr(cashflows[name]) * 100.0,
+            "Total_Funded": total_funded.get(name, 0.0),
+            "Total_Interest_Earned": total_interest.get(name, 0.0),
+            "Total_Principal_Returned": total_principal_returned.get(name, 0.0),
+            "Outstanding_Balance": balances.get(name, 0.0),
+            "Target_XIRR": target_rates.get(name, 0.08) * 100.0,
+            "Actual_XIRR": calc_xirr(cashflows.get(name, [])) * 100.0,
         })
-    return ledger_df, pd.DataFrame(summary_rows), cashflows
+    summary_df = pd.DataFrame(summary_rows, columns=["Investor", "Total_Funded", "Total_Interest_Earned",
+        "Total_Principal_Returned", "Outstanding_Balance", "Target_XIRR", "Actual_XIRR"])
+    cashflow_events_df = pd.DataFrame(cashflow_events, columns=["Date", "Investor", "Flow_Type", "Amount", "Signed_Cashflow"])
+    return ledger_df, summary_df, cashflow_events_df
 
 # ═══════════════════════════════════════════════════════════════
 # PLATFORM ECONOMICS & SPV CASHFLOWS
@@ -607,12 +916,11 @@ def build_pnl(schedule_df, fees, investor_summary_df, params):
     }
 
 
-def build_cashflows(schedule_df, investor_ledger_df, fees):
-    columns = ["Investor_Capital_Called", "Borrower_Interest_Received",
+def build_cashflows(schedule_df, investor_ledger_df, fees, investor_cashflows=None):
+    columns = ["Investor_Capital_Called", "Investor_Other_Increase", "Borrower_Interest_Received",
         "Borrower_Principal_Received", "Borrower_Fees_Received", "Total_Inflow",
-        "Net_Disbursed_to_Borrower", "Investor_Interest_Paid",
-        "Investor_Principal_Returned", "Total_Outflow", "Net_SPV_Cashflow",
-        "Cumulative_SPV_Cash"]
+        "Net_Disbursed_to_Borrower", "Investor_Interest_Paid", "Investor_Principal_Returned",
+        "Investor_Other_Decrease", "Total_Outflow", "Net_SPV_Cashflow", "Cumulative_SPV_Cash"]
     events = {}
 
     def bucket(event_date):
@@ -634,26 +942,45 @@ def build_cashflows(schedule_df, investor_ledger_df, fees):
         payment_event["Borrower_Principal_Received"] += float(row["Cash_Principal_Received"])
         payment_event["Borrower_Fees_Received"] += float(row["Cash_Fees_Received"])
 
-    for _, row in investor_ledger_df.iterrows():
-        draw_event = bucket(row["Drawdown_Date"])
-        draw_event["Investor_Capital_Called"] += float(row["Capital_Called"])
-        payment_event = bucket(row["Payment_Date"])
-        payment_event["Investor_Interest_Paid"] += float(row["Interest_Earned"])
-        payment_event["Investor_Principal_Returned"] += float(row["Principal_Returned"])
+    if investor_cashflows is not None and not investor_cashflows.empty:
+        flow_columns = {
+            "Capital Call": "Investor_Capital_Called",
+            "Other Increase": "Investor_Other_Increase",
+            "Interest Distribution": "Investor_Interest_Paid",
+            "Interest Payment": "Investor_Interest_Paid",
+            "Principal Repayment": "Investor_Principal_Returned",
+            "Scheduled Principal Return": "Investor_Principal_Returned",
+            "Other Decrease": "Investor_Other_Decrease",
+        }
+        for _, flow in investor_cashflows.iterrows():
+            column = flow_columns.get(str(flow["Flow_Type"]))
+            if column:
+                bucket(flow["Date"])[column] += float(flow["Amount"])
+    else:
+        # Backward-compatible fallback for callers without dated investor flows.
+        for _, row in investor_ledger_df.iterrows():
+            draw_event = bucket(row["Drawdown_Date"])
+            draw_event["Investor_Capital_Called"] += float(row["Capital_Called"])
+            payment_event = bucket(row["Payment_Date"])
+            payment_event["Investor_Interest_Paid"] += float(row["Interest_Earned"])
+            payment_event["Investor_Principal_Returned"] += float(row["Principal_Returned"])
+            draw_event["Investor_Other_Increase"] += float(row.get("Other_Increase", 0.0))
+            payment_event["Investor_Other_Decrease"] += float(row.get("Other_Decrease", 0.0))
 
     rows = []
     cumulative = 0.0
     for event_date in sorted(events):
         row = {"Date": event_date, **events[event_date]}
-        row["Total_Inflow"] = (row["Investor_Capital_Called"] + row["Borrower_Interest_Received"]
-            + row["Borrower_Principal_Received"] + row["Borrower_Fees_Received"])
+        row["Total_Inflow"] = (row["Investor_Capital_Called"] + row["Investor_Other_Increase"]
+            + row["Borrower_Interest_Received"] + row["Borrower_Principal_Received"]
+            + row["Borrower_Fees_Received"])
         row["Total_Outflow"] = (row["Net_Disbursed_to_Borrower"] + row["Investor_Interest_Paid"]
-            + row["Investor_Principal_Returned"])
+            + row["Investor_Principal_Returned"] + row["Investor_Other_Decrease"])
         row["Net_SPV_Cashflow"] = row["Total_Inflow"] - row["Total_Outflow"]
         cumulative += row["Net_SPV_Cashflow"]
         row["Cumulative_SPV_Cash"] = cumulative
         rows.append(row)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=["Date"] + columns)
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE HELPERS
@@ -679,6 +1006,11 @@ def load_deals():
     df = pd.read_sql("""SELECT d.*, b.name AS borrower_name FROM deals d
                        LEFT JOIN borrowers b ON d.borrower_id = b.id ORDER BY d.id DESC""", conn)
     conn.close()
+    if not df.empty:
+        df["loan_ranking"] = df.apply(lambda row: safe_json(row.get("params_json"), {}).get(
+            "loan_ranking", "Mezzanine" if row.get("facility_type") == "Mezzanine" else "Senior"), axis=1)
+    else:
+        df["loan_ranking"] = pd.Series(dtype="object")
     return df
 
 
@@ -690,8 +1022,127 @@ def save_deal(borrower_id, deal_name, facility, status, settlement, maturity,
         VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (borrower_id, deal_name, facility, status, settlement.isoformat(), maturity.isoformat(),
          facility_type, security_type, property_value, json.dumps(params)))
+    deal_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
     conn.close()
+    ensure_default_deal_investors(deal_id)
+    return deal_id
+
+
+def standard_split_for(investor_name, loan_ranking):
+    if loan_ranking == "Mezzanine":
+        return {"BPCFMC": 80.0, "BPCFLC": 20.0}.get(investor_name, 0.0)
+    return {"BPCFMC": 50.0, "BPCFLC": 15.0, "CBCF": 35.0}.get(investor_name, 0.0)
+
+
+def ensure_default_deal_investors(deal_id):
+    conn = get_conn()
+    core_defaults = {"BPCFMC": (50.0, 80.0), "BPCFLC": (15.0, 20.0), "CBCF": (35.0, 0.0)}
+    for name, (senior_pct, mezz_pct) in core_defaults.items():
+        investor = conn.execute("SELECT id FROM investors WHERE name=?", (name,)).fetchone()
+        if investor:
+            conn.execute("""INSERT OR IGNORE INTO deal_investors
+                (deal_id, investor_id, senior_default_pct, mezz_default_pct, is_active)
+                VALUES (?,?,?,?,1)""", (int(deal_id), int(investor[0]), senior_pct, mezz_pct))
+    conn.commit()
+    conn.close()
+
+
+def load_investors(active_only=True):
+    conn = get_conn()
+    where = "WHERE status='Active'" if active_only else ""
+    df = pd.read_sql(f"SELECT * FROM investors {where} ORDER BY name", conn)
+    conn.close()
+    return df
+
+
+def load_deal_investors(deal_id):
+    ensure_default_deal_investors(deal_id)
+    conn = get_conn()
+    df = pd.read_sql("""SELECT i.id, i.name, i.investor_type, i.target_irr, i.status,
+        di.senior_default_pct, di.mezz_default_pct
+        FROM deal_investors di JOIN investors i ON i.id=di.investor_id
+        WHERE di.deal_id=? AND di.is_active=1 AND i.status='Active' ORDER BY i.name""",
+        conn, params=(int(deal_id),))
+    conn.close()
+    return df
+
+
+def save_investor(name, investor_type, target_irr=8.0, notes=""):
+    conn = get_conn()
+    conn.execute("INSERT INTO investors (name, investor_type, target_irr, notes) VALUES (?,?,?,?)",
+                 (name.strip(), investor_type, float(target_irr), notes.strip()))
+    conn.commit()
+    conn.close()
+
+
+def update_investor(investor_id, name, investor_type, target_irr, status, notes=""):
+    conn = get_conn()
+    conn.execute("""UPDATE investors SET name=?, investor_type=?, target_irr=?, status=?, notes=?
+        WHERE id=?""", (name.strip(), investor_type, float(target_irr), status, notes.strip(), int(investor_id)))
+    conn.commit()
+    conn.close()
+
+
+def save_deal_investors(deal_id, investor_ids):
+    conn = get_conn()
+    conn.execute("UPDATE deal_investors SET is_active=0 WHERE deal_id=?", (int(deal_id),))
+    defaults = {"BPCFMC": (50.0, 80.0), "BPCFLC": (15.0, 20.0), "CBCF": (35.0, 0.0)}
+    for investor_id in investor_ids:
+        row = conn.execute("SELECT name FROM investors WHERE id=?", (int(investor_id),)).fetchone()
+        if not row:
+            continue
+        senior_pct, mezz_pct = defaults.get(row[0], (0.0, 0.0))
+        conn.execute("""INSERT INTO deal_investors
+            (deal_id, investor_id, senior_default_pct, mezz_default_pct, is_active)
+            VALUES (?,?,?,?,1)
+            ON CONFLICT(deal_id, investor_id) DO UPDATE SET is_active=1""",
+            (int(deal_id), int(investor_id), senior_pct, mezz_pct))
+    conn.commit()
+    conn.close()
+
+
+def save_investor_transaction(deal_id, tx_date, tx_type, investor_id, counterparty_id, amount,
+                              notes="", source="User"):
+    conn = get_conn()
+    conn.execute("""INSERT INTO investor_transactions
+        (deal_id, transaction_date, transaction_type, investor_id, counterparty_id, amount, notes, source)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (int(deal_id), parse_date(tx_date).isoformat(), tx_type, int(investor_id),
+         int(counterparty_id) if counterparty_id is not None else None,
+         float(amount), notes.strip(), source))
+    conn.commit()
+    conn.close()
+
+
+def load_investor_transactions(deal_id=None):
+    conn = get_conn()
+    query = """SELECT t.*, d.deal_name, src.name AS investor_name, dst.name AS counterparty_name
+        FROM investor_transactions t JOIN deals d ON d.id=t.deal_id
+        JOIN investors src ON src.id=t.investor_id
+        LEFT JOIN investors dst ON dst.id=t.counterparty_id"""
+    if deal_id is None:
+        df = pd.read_sql(query + " ORDER BY t.transaction_date DESC, t.id DESC", conn)
+    else:
+        df = pd.read_sql(query + " WHERE t.deal_id=? ORDER BY t.transaction_date DESC, t.id DESC",
+                         conn, params=(int(deal_id),))
+    conn.close()
+    return df
+
+
+def capital_calls_by_date(transactions_df):
+    result = {}
+    if transactions_df.empty:
+        return result
+    for _, row in transactions_df.iterrows():
+        if row["transaction_type"] != "Capital Call" or row.get("source", "User") == "Drawdown Plan":
+            continue
+        tx_date = parse_date(row["transaction_date"])
+        key = tx_date.isoformat()
+        result.setdefault(key, {})
+        name = row["investor_name"]
+        result[key][name] = result[key].get(name, 0.0) + float(row["amount"])
+    return result
 
 
 def update_deal_model(deal_id, params):
@@ -700,6 +1151,53 @@ def update_deal_model(deal_id, params):
         facility_type=?, property_value=?, params_json=? WHERE id=?""",
         (float(params["facility_amount"]), params["settlement_date"], params["maturity_date"],
          params["facility_type"], float(params["property_value"]), json.dumps(params), int(deal_id)))
+    conn.commit()
+    conn.close()
+    sync_actual_plan_capital_calls(deal_id, params)
+
+
+def sync_actual_plan_capital_calls(deal_id, params):
+    """Mirror saved Actual drawdown rows into the investor movement ledger."""
+    plan = safe_json(params.get("drawdown_schedule", {}), {})
+    if not isinstance(plan, dict):
+        plan = {}
+    conn = get_conn()
+    # Replace only entries generated by the plan; user-entered portal movements remain untouched.
+    conn.execute("DELETE FROM investor_transactions WHERE deal_id=? AND source='Drawdown Plan'",
+                 (int(deal_id),))
+    investor_ids = {name: int(investor_id) for investor_id, name in
+                    conn.execute("SELECT id, name FROM investors").fetchall()}
+    existing_user_calls = {(tx_date, investor_name) for tx_date, investor_name in conn.execute("""
+        SELECT t.transaction_date, i.name FROM investor_transactions t
+        JOIN investors i ON i.id=t.investor_id
+        WHERE t.deal_id=? AND t.transaction_type='Capital Call' AND t.source!='Drawdown Plan'""",
+        (int(deal_id),)).fetchall()}
+    for date_key, item in plan.items():
+        if not isinstance(item, dict) or str(item.get("status", "Forecast")) != "Actual":
+            continue
+        if str(item.get("allocation_source", "")) == "Investor Ledger":
+            continue
+        tx_date = parse_date(date_key)
+        if tx_date is None:
+            continue
+        allocations = item.get("allocations", {})
+        if not isinstance(allocations, dict):
+            continue
+        for investor_name, amount in allocations.items():
+            investor_name = str(investor_name)
+            try:
+                amount = float(amount)
+            except (TypeError, ValueError):
+                continue
+            if amount <= 0 or investor_name not in investor_ids:
+                continue
+            if (tx_date.isoformat(), investor_name) in existing_user_calls:
+                continue
+            conn.execute("""INSERT INTO investor_transactions
+                (deal_id, transaction_date, transaction_type, investor_id, counterparty_id,
+                 amount, notes, source) VALUES (?,?,?,?,?,?,?,?)""",
+                (int(deal_id), tx_date.isoformat(), "Capital Call", investor_ids[investor_name],
+                 None, amount, "Synced from actual drawdown plan", "Drawdown Plan"))
     conn.commit()
     conn.close()
 
@@ -847,7 +1345,7 @@ def page_borrowers():
 # PAGE: DEALS
 # ═══════════════════════════════════════════════════════════════
 
-FACILITY_TYPES = ["Construction", "Bridging", "Residential", "Term Loan", "Mezzanine", "Revolving"]
+FACILITY_TYPES = ["Construction", "Bridging", "Residential", "Term Loan", "Revolving"]
 SECURITY_TYPES = ["First Mortgage", "Second Mortgage", "Unsecured", "Personal Guarantee", "Other"]
 
 
@@ -872,9 +1370,11 @@ def page_deals():
             c5, c6 = st.columns(2)
             settlement = c5.date_input("Settlement date", value=date.today())
             maturity = c6.date_input("Maturity date", value=add_months(date.today(), 12))
-            c7, c8 = st.columns(2)
-            facility_type = c7.selectbox("Facility type", FACILITY_TYPES)
-            security_type = c8.selectbox("Security type", SECURITY_TYPES)
+            c7, c8, c9 = st.columns(3)
+            facility_type = c7.selectbox("Facility purpose / type", FACILITY_TYPES)
+            loan_ranking = c8.selectbox("Loan ranking", ["Senior", "Mezzanine"],
+                help="Ranking controls the default investor split; construction/bridge/residential controls the drawdown profile.")
+            security_type = c9.selectbox("Security type", SECURITY_TYPES)
             property_value = st.number_input("Property / security value", min_value=0.0,
                                              value=8_000_000.0, step=100_000.0)
             if st.form_submit_button("Create deal", type="primary"):
@@ -885,7 +1385,7 @@ def page_deals():
                 else:
                     borrower_id = borrower_labels[borrower_label]
                     save_deal(borrower_id, deal_name.strip(), facility, status, settlement, maturity,
-                              facility_type, security_type, property_value, {})
+                              facility_type, security_type, property_value, {"loan_ranking": loan_ranking})
                     st.success(f"Created deal: {deal_name.strip()}")
                     st.rerun()
 
@@ -896,11 +1396,11 @@ def page_deals():
     status_filter = st.multiselect("Filter by status", sorted(deals["deal_status"].dropna().unique().tolist()),
                                    default=sorted(deals["deal_status"].dropna().unique().tolist()))
     filtered = deals[deals["deal_status"].isin(status_filter)]
-    show_cols = ["id", "borrower_name", "deal_name", "facility_type", "facility_amount", "deal_status",
+    show_cols = ["id", "borrower_name", "deal_name", "facility_type", "loan_ranking", "facility_amount", "deal_status",
                  "settlement_date", "maturity_date", "security_type", "property_value"]
     display = filtered[[column for column in show_cols if column in filtered.columns]].rename(columns={
         "id": "Deal ID", "borrower_name": "Borrower", "deal_name": "Deal", "facility_type": "Facility Type",
-        "facility_amount": "Facility Amount", "deal_status": "Status", "settlement_date": "Settlement",
+        "loan_ranking": "Ranking", "facility_amount": "Facility Amount", "deal_status": "Status", "settlement_date": "Settlement",
         "maturity_date": "Maturity", "security_type": "Security", "property_value": "Security Value"})
     st.dataframe(display, use_container_width=True, hide_index=True)
 
@@ -921,6 +1421,10 @@ def page_modeler():
     deal_id = deal_labels[selected_label]
     deal_row = deals[deals["id"] == deal_id].iloc[0]
     existing_params = safe_json(deal_row.get("params_json", "{}"), {})
+    ensure_default_deal_investors(deal_id)
+    deal_investors_df = load_deal_investors(deal_id)
+    investor_transactions_df = load_investor_transactions(deal_id)
+    actual_capital_calls = capital_calls_by_date(investor_transactions_df)
 
     settlement_default = parse_date(existing_params.get("settlement_date"),
                                     parse_date(deal_row.get("settlement_date"), date.today()))
@@ -930,9 +1434,12 @@ def page_modeler():
     term_default = max(1, min(120, term_default))
     facility_default = float(existing_params.get("facility_amount", deal_row.get("facility_amount", 0)) or 0)
     property_default = float(existing_params.get("property_value", deal_row.get("property_value", 0)) or 0)
-    facility_type_default = str(existing_params.get("facility_type", deal_row.get("facility_type", "Construction")) or "Construction")
-    if facility_type_default not in FACILITY_TYPES:
-        facility_type_default = "Construction"
+    facility_type_raw = str(existing_params.get("facility_type", deal_row.get("facility_type", "Construction")) or "Construction")
+    legacy_mezzanine_type = facility_type_raw == "Mezzanine"
+    facility_type_default = facility_type_raw if facility_type_raw in FACILITY_TYPES else "Term Loan"
+    loan_ranking_default = str(existing_params.get("loan_ranking", "Mezzanine" if legacy_mezzanine_type else "Senior"))
+    if loan_ranking_default not in ["Senior", "Mezzanine"]:
+        loan_ranking_default = "Senior"
 
     st.markdown(f"### {deal_row['deal_name']}  ·  {deal_row['borrower_name']}")
     st.caption(f"Deal ID {deal_id}  |  Status: {deal_row['deal_status']}  |  Security: {deal_row['security_type']}")
@@ -999,27 +1506,22 @@ def page_modeler():
             c12.text_input("Security type", value=initial_security_type, disabled=True)
 
         with setup_tabs[1]:
-            st.subheader("Investor return targets and allocation")
-            i1, i2, i3 = st.columns(3)
-            init_widget_state(prefix + "fund_target_irr", float(existing_params.get("fund_target_irr", 8.0)))
-            fund_target_irr = i1.number_input("Fund target XIRR (% p.a.)", min_value=0.0, max_value=50.0,
-                step=0.25, key=prefix + "fund_target_irr")
-            init_widget_state(prefix + "cbfm_target_irr", float(existing_params.get("cbfm_target_irr", 10.0)))
-            cbfm_target_irr = i2.number_input("CBFM target XIRR (% p.a.)", min_value=0.0, max_value=50.0,
-                step=0.25, key=prefix + "cbfm_target_irr")
-            init_widget_state(prefix + "syndicate_target_irr", float(existing_params.get("syndicate_target_irr", 12.0)))
-            syndicate_target_irr = i3.number_input("Syndicate target XIRR (% p.a.)", min_value=0.0,
-                max_value=50.0, step=0.25, key=prefix + "syndicate_target_irr")
-            i4, i5 = st.columns(2)
-            init_widget_state(prefix + "cbfm_alloc_pct", float(existing_params.get("cbfm_alloc_pct", 0.0)))
-            cbfm_alloc = i4.number_input("CBFM allocation on later drawdowns (%)", min_value=0.0,
-                max_value=100.0, step=5.0, key=prefix + "cbfm_alloc_pct")
-            init_widget_state(prefix + "syndicate_alloc_pct", float(existing_params.get("syndicate_alloc_pct", 0.0)))
-            syndicate_alloc = i5.number_input("Syndicate allocation on later drawdowns (%)", min_value=0.0,
-                max_value=100.0, step=5.0, key=prefix + "syndicate_alloc_pct")
-            if cbfm_alloc + syndicate_alloc > 100:
-                st.error("CBFM and Syndicate allocations exceed 100%. Reduce one or both; the excess is normalized in the model until corrected.")
-            st.info("First funded draw: BPCFMC 50%, BPCFLC 15%, CBCF 35%. Later draws use the CBFM and Syndicate percentages above, with the remainder allocated to the three funds in the same ratios.")
+            st.subheader("Loan ranking and investors")
+            init_widget_state(prefix + "loan_ranking", loan_ranking_default)
+            if st.session_state[prefix + "loan_ranking"] not in ["Senior", "Mezzanine"]:
+                st.session_state[prefix + "loan_ranking"] = loan_ranking_default
+            loan_ranking = st.selectbox("Loan ranking", ["Senior", "Mezzanine"],
+                key=prefix + "loan_ranking",
+                help="Ranking determines the standard split. Facility purpose separately determines the drawdown curve.")
+            if loan_ranking == "Senior":
+                st.info("Senior default: BPCFMC 50% · BPCFLC 15% · CBCF 35%. Optional investors are 0% until you allocate them on a row.")
+            else:
+                st.info("Mezzanine default: BPCFMC 80% · BPCFLC 20%. CBCF is not included by default; optional investors can be attached and allocated when needed.")
+            if not deal_investors_df.empty:
+                inv_view = deal_investors_df[["name", "investor_type", "target_irr"]].rename(columns={
+                    "name": "Investor", "investor_type": "Type", "target_irr": "Target XIRR (%)"})
+                st.dataframe(inv_view, use_container_width=True, hide_index=True)
+            st.caption("Attach or remove optional investors (for example, CBFM or Syndicate) in the Investor Portal. Their allocation columns will then appear in the drawdown plan.")
 
         with setup_tabs[2]:
             st.subheader("Fees and security assumptions")
@@ -1070,10 +1572,8 @@ def page_modeler():
         "maturity_date": maturity_date.isoformat(), "term_months": int(term_months),
         "construction_months": int(construction_months), "borrower_irr": float(borrower_irr),
         "cpr": float(cpr), "drawdown_profile": drawdown_profile,
-        "s_curve_steepness": float(s_curve_steepness),
-        "fund_target_irr": float(fund_target_irr), "cbfm_target_irr": float(cbfm_target_irr),
-        "syndicate_target_irr": float(syndicate_target_irr), "cbfm_alloc_pct": float(cbfm_alloc),
-        "syndicate_alloc_pct": float(syndicate_alloc), "estab_fee_pct": float(estab_fee_pct),
+        "s_curve_steepness": float(s_curve_steepness), "loan_ranking": loan_ranking,
+        "estab_fee_pct": float(estab_fee_pct),
         "line_fee_pct": float(line_fee_pct), "admin_fee_monthly": float(admin_fee_monthly),
         "discharge_fee": float(discharge_fee), "risk_review_fee": float(risk_review_fee),
         "legal_fee": float(legal_fee), "other_upfront_fees": float(other_upfront_fees),
@@ -1081,28 +1581,39 @@ def page_modeler():
         "covenant_lvr": float(covenant_lvr), "penalty_rate": float(penalty_rate),
     }
 
-    # ── Editable, Excel-like drawdown grid ─────────────────────
+    # ── Editable drawdown and investor allocation matrix ─────────
     signature = drawdown_signature(deal_id, facility_amount, facility_type, settlement,
         term_months, construction_months, drawdown_profile, s_curve_steepness)
     stored_signature = existing_params.get("drawdown_signature")
     template = build_drawdown_template(settlement, term_months, facility_amount, facility_type,
         construction_months, drawdown_profile, s_curve_steepness)
+    investor_names = deal_investors_df["name"].tolist()
+    if not investor_transactions_df.empty:
+        for column in ["investor_name", "counterparty_name"]:
+            for investor_name in investor_transactions_df[column].dropna().astype(str).tolist():
+                if investor_name not in investor_names:
+                    investor_names.append(investor_name)
+    upfront_total = compute_fees(params)["upfront_total"]
     force_template_key = prefix + "force_drawdown_template"
     reset_count_key = prefix + "drawdown_reset_count"
     init_widget_state(force_template_key, False)
     init_widget_state(reset_count_key, 0)
+    allocation_fingerprint = hashlib.sha1(json.dumps({
+        "investors": investor_names, "ranking": loan_ranking,
+        "calls": actual_capital_calls}, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:9]
 
     with tabs[2]:
-        st.subheader("Drawdown Plan")
+        st.subheader("Drawdown and investor allocation plan")
         resolved_profile = resolve_drawdown_profile(facility_type, drawdown_profile)
-        if resolved_profile == "S-curve":
-            profile_description = f"Construction S-curve across up to {max(1, int(construction_months))} draw periods."
-        elif resolved_profile == "Straight-line":
-            profile_description = f"Straight-line drawdown across up to {max(1, int(construction_months))} draw periods."
-        else:
-            profile_description = "Full facility drawn at settlement by default."
-        st.markdown(f'<div class="section-note">{profile_description} The suggested dates follow calendar anniversaries. Edit any draw amount below; every model output updates immediately.</div>',
+        profile_description = (f"Construction S-curve over up to {max(1, int(construction_months))} draw dates."
+            if resolved_profile == "S-curve" else
+            f"Straight-line over up to {max(1, int(construction_months))} draw dates."
+            if resolved_profile == "Straight-line" else "Full draw at settlement by default.")
+        standard_text = ("Senior default: 50% BPCFMC / 15% BPCFLC / 35% CBCF."
+            if loan_ranking == "Senior" else "Mezz default: 80% BPCFMC / 20% BPCFLC; CBCF is excluded by default.")
+        st.markdown(f'<div class="section-note">{profile_description} {standard_text} Optional investors are included only when attached to this deal. Choose Standard, Investor Ledger or Manual for each row. Manual allocations are editable dollar amounts and should reconcile to the net amount to allocate.</div>',
                     unsafe_allow_html=True)
+        st.caption("Investor Ledger rows use Capital Call movements recorded in the Investor Portal. Forecast rows default to the Senior/Mezz split. Choose Manual to override a row; the model checks each row against the net funding amount after upfront fee netting.")
 
         reset_clicked = st.button("Reset to suggested schedule", key=prefix + "reset_drawdown_button")
         if reset_clicked:
@@ -1112,67 +1623,57 @@ def page_modeler():
 
         use_template = bool(st.session_state.get(force_template_key, False)) or (
             stored_signature is not None and stored_signature != signature)
-        if use_template:
-            initial_plan = template.copy()
-        else:
-            initial_plan = migrate_drawdown_plan(existing_params.get("drawdown_schedule", {}),
-                                                  settlement, term_months, template)
+        initial_matrix = build_drawdown_matrix(template, existing_params.get("drawdown_schedule", {}),
+            actual_capital_calls, investor_names, loan_ranking, upfront_total, settlement, use_template)
+        initial_matrix = initial_matrix.drop(columns=["_prior_allocations", "_net_to_allocate"], errors="ignore")
         st.session_state[force_template_key] = False
-        editor_key = prefix + "drawdown_editor_" + signature + "_" + str(st.session_state[reset_count_key])
-        edited_plan = st.data_editor(
-            initial_plan,
-            key=editor_key,
-            hide_index=True,
-            use_container_width=True,
-            num_rows="fixed",
-            column_config={
-                "Drawdown Date": st.column_config.DateColumn("Drawdown date", format="DD MMM YYYY", disabled=True),
-                "Drawdown Amount": st.column_config.NumberColumn("Drawdown amount", min_value=0.0,
-                    max_value=max(float(facility_amount), 0.0), step=10_000.0, format="$%.0f", required=True),
-            },
-        )
-        drawdown_map = {}
-        plan_rows = []
-        cumulative = 0.0
-        for _, item in edited_plan.iterrows():
-            draw_date = parse_date(item.get("Drawdown Date"))
-            try:
-                amount = max(0.0, float(item.get("Drawdown Amount", 0) or 0))
-            except (TypeError, ValueError):
-                amount = 0.0
-            if draw_date is None:
-                continue
-            drawdown_map[draw_date.isoformat()] = amount
-            cumulative += amount
-            plan_rows.append({
-                "Drawdown Date": draw_date,
-                "Drawdown Amount": amount,
-                "% of Facility": amount / facility_amount * 100.0 if facility_amount > 0 else 0.0,
-                "Cumulative Drawn": cumulative,
-                "Undrawn Facility": max(float(facility_amount) - cumulative, 0.0),
-            })
-        plan_summary = pd.DataFrame(plan_rows)
-        planned_total = sum(drawdown_map.values())
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Planned gross draws", money(planned_total))
-        s2.metric("Facility drawn", percent(planned_total / facility_amount * 100.0 if facility_amount else 0.0))
-        s3.metric("Remaining facility", money(max(float(facility_amount) - planned_total, 0.0)))
-        if planned_total > float(facility_amount) + 0.01:
-            st.error("Total drawdowns exceed the facility. Reduce the schedule or increase the facility amount.")
-        elif planned_total < float(facility_amount) - 0.01:
-            st.warning("The drawdown schedule does not use the full facility. This is allowed; the unused amount remains undrawn.")
-        st.dataframe(plan_summary.style.format({
-            "Drawdown Amount": "${:,.0f}", "% of Facility": "{:.1f}%",
-            "Cumulative Drawn": "${:,.0f}", "Undrawn Facility": "${:,.0f}",
-        }), use_container_width=True, hide_index=True)
+        editor_key = (prefix + "allocation_matrix_" + signature + "_" + allocation_fingerprint + "_"
+                      + str(st.session_state[reset_count_key]))
+        column_config = {
+            "Drawdown Date": st.column_config.DateColumn("Drawdown date", format="DD MMM YYYY", disabled=True),
+            "Status": st.column_config.SelectboxColumn("Actual / forecast", options=["Forecast", "Actual"], required=True),
+            "Allocation Source": st.column_config.SelectboxColumn("Allocation source",
+                options=["Standard", "Investor Ledger", "Manual"], required=True),
+            "Gross Drawdown": st.column_config.NumberColumn("Gross drawdown", min_value=0.0,
+                max_value=max(float(facility_amount), 0.0), step=10_000.0, format="$%.0f", required=True),
+        }
+        for investor_name in investor_names:
+            column_config[allocation_column(investor_name)] = st.column_config.NumberColumn(
+                investor_name, min_value=0.0, max_value=max(float(facility_amount), 0.0),
+                step=10_000.0, format="$%.0f", required=True)
+        edited_plan = st.data_editor(initial_matrix, key=editor_key, hide_index=True,
+            use_container_width=True, num_rows="fixed", column_config=column_config)
+        drawdown_map, plan_summary = effective_drawdown_plan(edited_plan, investor_names,
+            actual_capital_calls, loan_ranking, upfront_total)
+
+        gross_total = float(plan_summary["Gross Drawdown"].sum()) if not plan_summary.empty else 0.0
+        net_total = float(plan_summary["Net Amount to Allocate"].sum()) if not plan_summary.empty else 0.0
+        allocation_total = float(plan_summary[investor_names].sum().sum()) if investor_names and not plan_summary.empty else 0.0
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Gross draws", money(gross_total))
+        s2.metric("Net to investors", money(net_total))
+        s3.metric("Allocated to investors", money(allocation_total))
+        s4.metric("Unallocated / overallocated", money(net_total - allocation_total))
+        if gross_total > float(facility_amount) + 0.01:
+            st.error("Total gross drawdowns exceed the facility amount.")
+        allocation_issues = plan_summary[plan_summary["Allocation Difference"].abs() > 0.01] if not plan_summary.empty else pd.DataFrame()
+        if not allocation_issues.empty:
+            issue_dates = ", ".join(value.strftime("%d %b %Y") for value in allocation_issues["Drawdown Date"])
+            st.warning(f"Investor allocations do not reconcile to net funding on: {issue_dates}. Check the row’s Allocation Source or adjust its investor amounts.")
+
+        summary_format = {column: "${:,.0f}" for column in plan_summary.columns
+                          if column not in ["Drawdown Date", "Status", "Allocation Source"]}
+        st.dataframe(plan_summary.style.format(summary_format), use_container_width=True, hide_index=True)
         if not plan_summary.empty:
+            plan_chart = plan_summary.copy()
+            plan_chart["Cumulative Drawn"] = plan_chart["Gross Drawdown"].cumsum()
             fig = go.Figure()
-            fig.add_trace(go.Bar(x=plan_summary["Drawdown Date"], y=plan_summary["Drawdown Amount"],
-                                 name="Drawdown", marker_color="#4778b8"))
-            fig.add_trace(go.Scatter(x=plan_summary["Drawdown Date"], y=plan_summary["Cumulative Drawn"],
+            fig.add_trace(go.Bar(x=plan_chart["Drawdown Date"], y=plan_chart["Gross Drawdown"],
+                                 name="Gross draw", marker_color="#4778b8"))
+            fig.add_trace(go.Scatter(x=plan_chart["Drawdown Date"], y=plan_chart["Cumulative Drawn"],
                 name="Cumulative drawn", mode="lines+markers", yaxis="y2", line=dict(color="#43a581", width=3)))
             fig.update_layout(title="Drawdowns and cumulative facility usage", height=350,
-                xaxis_title="Drawdown date", yaxis=dict(title="Drawdown", tickprefix="$"),
+                xaxis_title="Drawdown date", yaxis=dict(title="Gross draw", tickprefix="$"),
                 yaxis2=dict(title="Cumulative drawn", overlaying="y", side="right", tickprefix="$"),
                 legend=dict(orientation="h", y=1.12), margin=dict(t=55, b=20))
             st.plotly_chart(fig, use_container_width=True)
@@ -1184,9 +1685,10 @@ def page_modeler():
     actuals_df = load_actuals(deal_id)
     actuals_map = actuals_to_map(actuals_df, settlement, term_months)
     schedule_df, fees, borrower_xirr, borrower_cashflows = build_schedule(params, actuals_map, drawdown_map)
-    investor_ledger_df, investor_summary_df, investor_cashflows = build_investor_ledger(schedule_df, params)
+    investor_ledger_df, investor_summary_df, investor_cashflows = build_investor_ledger(
+        schedule_df, params, deal_investors_df, investor_transactions_df)
     pnl = build_pnl(schedule_df, fees, investor_summary_df, params)
-    cashflow_df = build_cashflows(schedule_df, investor_ledger_df, fees)
+    cashflow_df = build_cashflows(schedule_df, investor_ledger_df, fees, investor_cashflows)
 
     # ── Overview ────────────────────────────────────────────────
     with tabs[0]:
@@ -1208,7 +1710,7 @@ def page_modeler():
         st.caption("This saves terms, dates, fees, investor assumptions and the edited drawdown schedule to the selected deal.")
         if st.button("Save all changes", type="primary", key=prefix + "save_all_changes"):
             update_deal_model(deal_id, params)
-            st.success("Deal assumptions and drawdown schedule saved.")
+            st.success("Deal assumptions saved; Actual drawdown allocations have been synced to the Investor Portal.")
 
         due_breaches = schedule_df[schedule_df["Covenant_Breach"]]
         if not due_breaches.empty:
@@ -1358,7 +1860,7 @@ def page_modeler():
     # ── Investor ledger ─────────────────────────────────────────
     with tabs[5]:
         st.subheader("Investor base and returns")
-        st.info("First funded draw is allocated 50% / 15% / 35% to BPCFMC / BPCFLC / CBCF. Later draws follow the allocation inputs in Setup & Terms. Investor interest accrues over actual date intervals.")
+        st.info("Standard rows use the deal ranking: Senior 50% / 15% / 35% (BPCFMC / BPCFLC / CBCF), or Mezzanine 80% / 20% (BPCFMC / BPCFLC). Investor Ledger and Manual rows use their recorded/entered splits. Buyouts and actual repayments are applied from Investor Portal transactions.")
         summary_format = {"Total_Funded": "${:,.0f}", "Total_Interest_Earned": "${:,.0f}",
             "Total_Principal_Returned": "${:,.0f}", "Outstanding_Balance": "${:,.0f}",
             "Target_XIRR": "{:.2f}%", "Actual_XIRR": "{:.2f}%"}
@@ -1377,8 +1879,10 @@ def page_modeler():
         selected_investors = st.multiselect("Investors", investor_options, default=investor_options,
                                             key=prefix + "investor_filter")
         filtered_ledger = investor_ledger_df[investor_ledger_df["Investor"].isin(selected_investors)].copy()
-        ledger_format = {"Capital_Called": "${:,.0f}", "Interest_Earned": "${:,.0f}",
-            "Principal_Returned": "${:,.0f}", "Ending_Balance": "${:,.0f}",
+        ledger_format = {"Capital_Called": "${:,.0f}", "Other_Increase": "${:,.0f}",
+            "Other_Decrease": "${:,.0f}", "Interest_Earned": "${:,.0f}",
+            "Principal_Returned": "${:,.0f}", "Buyout_In": "${:,.0f}", "Buyout_Out": "${:,.0f}",
+            "Ending_Balance": "${:,.0f}",
             "Cumulative_Funded": "${:,.0f}", "Cumulative_Interest": "${:,.0f}"}
         st.dataframe(filtered_ledger.style.format(ledger_format), use_container_width=True, hide_index=True, height=380)
         if selected_investors:
@@ -1423,7 +1927,7 @@ def page_modeler():
     # ── SPV cashflows ───────────────────────────────────────────
     with tabs[7]:
         st.subheader("SPV cashflows by event date")
-        st.caption("Capital calls and borrower disbursements are recorded on draw dates; collections and investor payments are recorded on payment dates. Logged actual collections replace the forecast cash receipt for that date.")
+        st.caption("Investor calls, repayments, distributions and other movements are recorded on their transaction dates. Forecast interest and scheduled principal remain on settlement anniversaries; logged actual movements replace the affected investor forecast.")
         cashflow_format = {column: "${:,.0f}" for column in cashflow_df.columns if column != "Date"}
         st.dataframe(cashflow_df.style.format(cashflow_format), use_container_width=True, hide_index=True, height=420)
         c1, c2 = st.columns(2)
@@ -1515,6 +2019,290 @@ def page_modeler():
                 key=prefix + "download_export")
 
 # ═══════════════════════════════════════════════════════════════
+# PAGE: INVESTOR PORTAL (INTERNAL)
+# ═══════════════════════════════════════════════════════════════
+
+def transaction_balances(transactions_df, as_of=None):
+    balances = {}
+    names = {}
+    cutoff = parse_date(as_of) if as_of is not None else None
+    for _, row in transactions_df.iterrows():
+        tx_date = parse_date(row.get("transaction_date"))
+        if cutoff is not None and (tx_date is None or tx_date > cutoff):
+            continue
+        investor_id = int(row["investor_id"])
+        investor_name = str(row["investor_name"])
+        names[investor_id] = investor_name
+        tx_type = str(row["transaction_type"])
+        amount = float(row["amount"])
+        balances[investor_id] = balances.get(investor_id, 0.0)
+        if tx_type in ["Capital Call", "Other Increase"]:
+            balances[investor_id] += amount
+        elif tx_type in ["Principal Repayment", "Other Decrease"]:
+            balances[investor_id] -= amount
+        elif tx_type == "Buyout":
+            balances[investor_id] -= amount
+            counterparty = row.get("counterparty_id")
+            if pd.notna(counterparty):
+                counterparty = int(counterparty)
+                names[counterparty] = str(row.get("counterparty_name", "Investor"))
+                balances[counterparty] = balances.get(counterparty, 0.0) + amount
+    return pd.DataFrame([{"Investor": names.get(investor_id, str(investor_id)),
+        "Outstanding Capital (actual ledger)": balance}
+        for investor_id, balance in sorted(balances.items(), key=lambda item: names.get(item[0], ""))])
+
+
+def page_investor_portal():
+    st.title("Investor Portal")
+    st.caption("Internal investor register, deal assignments and dated movement ledger. Optional investors such as CBFM or Syndicate are attached only to the deals where they participate.")
+    investor_tabs = st.tabs(["Investor Register", "Deal Assignments", "Record Movement", "Activity & Balances"])
+
+    # Register investors
+    with investor_tabs[0]:
+        st.subheader("Investor register")
+        with st.expander("＋ Add investor", expanded=False):
+            with st.form("add_investor_form"):
+                c1, c2, c3 = st.columns(3)
+                investor_name = c1.text_input("Investor name *")
+                investor_type = c2.selectbox("Investor type", ["Fund", "CBFM", "Syndicate", "Institutional", "Individual", "Other"])
+                investor_target = c3.number_input("Target XIRR (% p.a.)", min_value=0.0, max_value=50.0, value=8.0, step=0.25)
+                investor_notes = st.text_input("Notes")
+                if st.form_submit_button("Save investor", type="primary"):
+                    if not investor_name.strip():
+                        st.error("Investor name is required.")
+                    else:
+                        try:
+                            save_investor(investor_name, investor_type, investor_target, investor_notes)
+                            st.success(f"Added {investor_name.strip()}.")
+                            st.rerun()
+                        except sqlite3.IntegrityError:
+                            st.error("An investor with that name already exists.")
+        investors = load_investors(active_only=False)
+        if investors.empty:
+            st.info("No investors found.")
+        else:
+            st.dataframe(investors[["id", "name", "investor_type", "target_irr", "status", "notes"]].rename(columns={
+                "id": "ID", "name": "Investor", "investor_type": "Type", "target_irr": "Target XIRR (%)",
+                "status": "Status", "notes": "Notes"}), use_container_width=True, hide_index=True)
+            manage_id = st.selectbox("Manage investor", investors["id"].astype(int).tolist(),
+                format_func=lambda value: f"{investors.loc[investors.id == int(value), 'name'].iloc[0]} · ID {int(value)}",
+                key="manage_investor_id")
+            manage_row = investors[investors["id"] == manage_id].iloc[0]
+            is_core = str(manage_row["name"]) in ["BPCFMC", "BPCFLC", "CBCF"]
+            type_options = ["Fund", "CBFM", "Syndicate", "Institutional", "Individual", "Other"]
+            if str(manage_row["investor_type"]) not in type_options:
+                type_options.append(str(manage_row["investor_type"]))
+            with st.form(f"edit_investor_form_{int(manage_id)}"):
+                ec1, ec2, ec3 = st.columns(3)
+                edited_name = ec1.text_input("Investor name", value=str(manage_row["name"]),
+                    disabled=is_core, key=f"edit_investor_name_{int(manage_id)}")
+                edited_type = ec2.selectbox("Investor type", type_options,
+                    index=type_options.index(str(manage_row["investor_type"])),
+                    key=f"edit_investor_type_{int(manage_id)}")
+                edited_target = ec3.number_input("Target XIRR (% p.a.)", min_value=0.0, max_value=50.0,
+                    value=float(manage_row["target_irr"] or 8.0), step=0.25,
+                    key=f"edit_investor_target_{int(manage_id)}")
+                status_options = ["Active", "Inactive"]
+                current_status = str(manage_row["status"] or "Active")
+                if current_status not in status_options:
+                    status_options.append(current_status)
+                edited_status = st.selectbox("Status", status_options,
+                    index=status_options.index(current_status), disabled=is_core,
+                    key=f"edit_investor_status_{int(manage_id)}")
+                edited_notes = st.text_area("Notes", value=str(manage_row["notes"] or ""),
+                    key=f"edit_investor_notes_{int(manage_id)}")
+                if st.form_submit_button("Save investor details"):
+                    if not edited_name.strip():
+                        st.error("Investor name is required.")
+                    else:
+                        try:
+                            update_investor(manage_id, edited_name, edited_type, edited_target,
+                                            edited_status, edited_notes)
+                            st.success("Investor details updated.")
+                            st.rerun()
+                        except sqlite3.IntegrityError:
+                            st.error("An investor with that name already exists.")
+            if is_core:
+                st.caption("Core pool names and active status are fixed to preserve standard allocation rules.")
+
+    deals = load_deals()
+    active_investors = load_investors(active_only=True)
+    if deals.empty:
+        with investor_tabs[1]:
+            st.info("Create a deal before assigning investors.")
+        with investor_tabs[2]:
+            st.info("Create a deal before recording investor movements.")
+        with investor_tabs[3]:
+            st.info("No deal activity to show yet.")
+        return
+
+    deal_labels = {f"{row['deal_name']} · {row['borrower_name']} · ID {int(row['id'])}": int(row["id"])
+                   for _, row in deals.iterrows()}
+    label_by_deal = {value: key for key, value in deal_labels.items()}
+    investor_labels = {int(row["id"]): str(row["name"]) for _, row in active_investors.iterrows()}
+
+    # Attach optional investor entities to a deal
+    with investor_tabs[1]:
+        st.subheader("Deal investor assignments")
+        assignment_label = st.selectbox("Select deal", list(deal_labels.keys()), key="investor_assign_deal")
+        assignment_deal_id = deal_labels[assignment_label]
+        current_assignment = load_deal_investors(assignment_deal_id)
+        current_ids = [int(value) for value in current_assignment["id"].tolist()]
+        assignment_key = f"investor_assignment_{assignment_deal_id}"
+        if assignment_key not in st.session_state:
+            st.session_state[assignment_key] = current_ids
+        selected_ids = st.multiselect("Investors attached to this deal", list(investor_labels.keys()),
+            key=assignment_key, format_func=lambda value: investor_labels.get(int(value), str(value)))
+        st.caption("Core funds are attached automatically. Add optional investors here; their allocation columns will appear in the deal’s drawdown matrix.")
+        if st.button("Save deal assignments", type="primary", key=f"save_assignments_{assignment_deal_id}"):
+            save_deal_investors(assignment_deal_id, selected_ids)
+            st.success("Deal investor assignments saved.")
+            st.rerun()
+        if not current_assignment.empty:
+            assignment_view = current_assignment[["name", "investor_type", "target_irr", "senior_default_pct", "mezz_default_pct"]].rename(columns={
+                "name": "Investor", "investor_type": "Type", "target_irr": "Target XIRR (%)",
+                "senior_default_pct": "Senior default (%)", "mezz_default_pct": "Mezz default (%)"})
+            st.dataframe(assignment_view, use_container_width=True, hide_index=True)
+
+    # Record actual movements; buyouts are entered as a single total with a user-defined seller split.
+    with investor_tabs[2]:
+        st.subheader("Record an investor movement")
+        movement_label = st.selectbox("Deal", list(deal_labels.keys()), key="movement_deal")
+        movement_deal_id = deal_labels[movement_label]
+        attached = load_deal_investors(movement_deal_id)
+        if attached.empty:
+            st.warning("Attach at least one investor to this deal first.")
+        else:
+            attached_ids = [int(value) for value in attached["id"].tolist()]
+            attached_names = {int(row["id"]): str(row["name"]) for _, row in attached.iterrows()}
+            move_type = st.selectbox("Movement type", ["Capital Call", "Principal Repayment", "Interest Distribution",
+                "Buyout", "Other Increase", "Other Decrease"], key=f"movement_type_{movement_deal_id}")
+            movement_date = st.date_input("Movement date", value=date.today(), key=f"movement_date_{movement_deal_id}")
+            if move_type == "Buyout":
+                buyer_id = st.selectbox("Buying investor", attached_ids,
+                    format_func=lambda value: attached_names.get(int(value), str(value)), key=f"buyout_buyer_{movement_deal_id}")
+                sellers = [value for value in attached_ids if value != buyer_id]
+                if not sellers:
+                    st.warning("Attach at least two investors to record a buyout.")
+                else:
+                    buyout_total = st.number_input("Total buyout amount", min_value=0.0,
+                        max_value=1_000_000_000.0, value=0.0, step=10_000.0, key=f"buyout_amount_{movement_deal_id}")
+                    shares_df = pd.DataFrame({"Selling Investor": [attached_names[value] for value in sellers],
+                        "Share (%)": [0.0 for _ in sellers]})
+                    shares_key = f"buyout_shares_{movement_deal_id}_{buyer_id}"
+                    shares = st.data_editor(shares_df, key=shares_key, hide_index=True, use_container_width=True,
+                        num_rows="fixed", column_config={
+                            "Selling Investor": st.column_config.TextColumn("Selling investor", disabled=True),
+                            "Share (%)": st.column_config.NumberColumn("Share of buyout (%)", min_value=0.0,
+                                max_value=100.0, step=5.0, format="%.1f", required=True),
+                        })
+                    share_total = float(pd.to_numeric(shares["Share (%)"], errors="coerce").fillna(0).sum())
+                    st.caption(f"Seller shares allocated: {share_total:.1f}% (must total 100%). Enter your agreed buyout ratio; a separate ledger transfer will be recorded for each seller.")
+                    buyout_notes = st.text_input("Buyout notes", key=f"buyout_notes_{movement_deal_id}")
+                    if st.button("Record buyout", type="primary", key=f"save_buyout_{movement_deal_id}"):
+                        if buyout_total <= 0:
+                            st.error("Enter a buyout amount greater than zero.")
+                        elif abs(share_total - 100.0) > 0.01:
+                            st.error("Seller shares must add up to 100%.")
+                        else:
+                            prior_transactions = load_investor_transactions(movement_deal_id)
+                            prior_balances_df = transaction_balances(prior_transactions, as_of=movement_date)
+                            prior_balances = dict(zip(prior_balances_df.get("Investor", []),
+                                prior_balances_df.get("Outstanding Capital (actual ledger)", [])))
+                            requested = []
+                            invalid_seller = None
+                            for _, share_row in shares.iterrows():
+                                share_pct = float(share_row["Share (%)"] or 0)
+                                if share_pct <= 0:
+                                    continue
+                                seller_name = str(share_row["Selling Investor"])
+                                transfer_amount = buyout_total * share_pct / 100.0
+                                if transfer_amount > float(prior_balances.get(seller_name, 0.0)) + 0.01:
+                                    invalid_seller = seller_name
+                                    break
+                                seller_id = next(value for value in sellers if attached_names[value] == seller_name)
+                                requested.append((seller_id, transfer_amount))
+                            if invalid_seller:
+                                st.error(f"Buyout exceeds {invalid_seller}'s recorded capital balance. Log the relevant capital call first or reduce the seller share.")
+                            else:
+                                for seller_id, transfer_amount in requested:
+                                    save_investor_transaction(movement_deal_id, movement_date, "Buyout",
+                                        seller_id, buyer_id, transfer_amount, buyout_notes)
+                                st.success("Buyout transfer recorded.")
+                                st.rerun()
+            else:
+                with st.form(f"movement_form_{movement_deal_id}"):
+                    tx_investor = st.selectbox("Investor", attached_ids,
+                        format_func=lambda value: attached_names.get(int(value), str(value)))
+                    tx_amount = st.number_input("Amount", min_value=0.0, max_value=1_000_000_000.0,
+                        value=0.0, step=10_000.0)
+                    tx_notes = st.text_input("Notes / reference")
+                    if st.form_submit_button("Save movement", type="primary"):
+                        if tx_amount <= 0:
+                            st.error("Enter an amount greater than zero.")
+                        elif move_type in ["Principal Repayment", "Other Decrease"]:
+                            prior_transactions = load_investor_transactions(movement_deal_id)
+                            prior_balances_df = transaction_balances(prior_transactions, as_of=movement_date)
+                            prior_balances = dict(zip(prior_balances_df.get("Investor", []),
+                                prior_balances_df.get("Outstanding Capital (actual ledger)", [])))
+                            investor_name = attached_names[int(tx_investor)]
+                            if tx_amount > float(prior_balances.get(investor_name, 0.0)) + 0.01:
+                                st.error(f"Repayment exceeds {investor_name}'s recorded capital balance.")
+                            else:
+                                save_investor_transaction(movement_deal_id, movement_date, move_type,
+                                    tx_investor, None, tx_amount, tx_notes)
+                                st.success("Investor movement recorded.")
+                                st.rerun()
+                        else:
+                            save_investor_transaction(movement_deal_id, movement_date, move_type,
+                                tx_investor, None, tx_amount, tx_notes)
+                            st.success("Investor movement recorded.")
+                            st.rerun()
+
+    # Ledger and capital balances derived from actual movement records
+    with investor_tabs[3]:
+        st.subheader("Investor activity and actual capital balances")
+        activity_filter = st.selectbox("Deal filter", ["All deals"] + list(deal_labels.keys()),
+                                       key="investor_activity_filter")
+        if activity_filter == "All deals":
+            transactions = load_investor_transactions()
+        else:
+            transactions = load_investor_transactions(deal_labels[activity_filter])
+        if transactions.empty:
+            st.info("No investor movements recorded yet. Use Record Movement to log calls, repayments, distributions or buyouts.")
+        else:
+            def transaction_from(row):
+                if row["transaction_type"] == "Capital Call":
+                    return "Investor"
+                if row["transaction_type"] == "Buyout":
+                    return row["investor_name"]
+                return "SPV"
+            def transaction_to(row):
+                if row["transaction_type"] == "Capital Call":
+                    return "SPV"
+                if row["transaction_type"] == "Buyout":
+                    return row["counterparty_name"]
+                return row["investor_name"]
+            activity = pd.DataFrame({
+                "Date": transactions["transaction_date"],
+                "Deal": transactions["deal_name"],
+                "Movement": transactions["transaction_type"],
+                "From": transactions.apply(transaction_from, axis=1),
+                "To": transactions.apply(transaction_to, axis=1),
+                "Amount": transactions["amount"],
+                "Source": transactions["source"],
+                "Notes": transactions["notes"],
+            })
+            st.dataframe(activity.style.format({"Amount": "${:,.0f}"}), use_container_width=True, hide_index=True)
+            st.markdown("#### Principal exposure by investor")
+            balances = transaction_balances(transactions)
+            if balances.empty:
+                st.info("No capital balances to report.")
+            else:
+                st.dataframe(balances.style.format({"Outstanding Capital (actual ledger)": "${:,.0f}"}),
+                             use_container_width=True, hide_index=True)
+
+# ═══════════════════════════════════════════════════════════════
 # NAVIGATION
 # ═══════════════════════════════════════════════════════════════
 PAGES = {
@@ -1522,6 +2310,7 @@ PAGES = {
     "🏢 Borrowers": page_borrowers,
     "📄 Deals": page_deals,
     "🧮 Deal Workspace": page_modeler,
+    "👥 Investor Portal": page_investor_portal,
 }
 
 with st.sidebar:
@@ -1530,7 +2319,7 @@ with st.sidebar:
     st.markdown("---")
     selection = st.radio("Navigate", list(PAGES.keys()), label_visibility="collapsed")
     st.markdown("---")
-    st.caption("Date-based model · Live-linked assumptions")
+    st.caption("Date-based model · Investor allocations · Live ledger")
 
 try:
     PAGES[selection]()
