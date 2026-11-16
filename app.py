@@ -165,19 +165,64 @@ def safe_json(value, fallback=None):
         return fallback
 
 
-FACILITY_TYPES = ["Construction", "Bridge", "Residual Stock"]
+FACILITY_TYPES = ["Construction", "Bridging", "Residual Stock"]
 
 
-def normalize_facility_type(value, fallback="Bridge"):
+def normalize_facility_type(value, fallback="Bridging"):
     """Normalize legacy facility labels to the three supported facility types."""
     label = str(value or "").strip().lower()
     aliases = {
         "construction": "Construction",
-        "bridge": "Bridge",
-        "bridging": "Bridge",
+        "bridge": "Bridging",
+        "bridging": "Bridging",
         "residual stock": "Residual Stock",
     }
     return aliases.get(label, fallback)
+
+
+PRINCIPAL_REPAYMENT_MODES = ["Standard amortising", "Bullet at maturity", "Custom schedule"]
+PRINCIPAL_REPAYMENT_BASES = ["Dollar amount", "% of original tranche"]
+
+
+def default_principal_repayment_mode(facility_type):
+    return "Bullet at maturity" if normalize_facility_type(facility_type) == "Bridging" else "Standard amortising"
+
+
+def parse_principal_repayment_rows(raw_schedule):
+    """Normalize saved custom principal repayments to dated amount/basis records."""
+    if isinstance(raw_schedule, str):
+        raw_schedule = safe_json(raw_schedule, [])
+    if isinstance(raw_schedule, dict):
+        source_rows = []
+        for due_date, value in raw_schedule.items():
+            if isinstance(value, dict):
+                source_rows.append({"due_date": due_date, **value})
+            else:
+                source_rows.append({"due_date": due_date, "amount": value, "basis": "Dollar amount"})
+    elif isinstance(raw_schedule, list):
+        source_rows = raw_schedule
+    else:
+        source_rows = []
+
+    rows = []
+    for item in source_rows:
+        if not isinstance(item, dict):
+            continue
+        due_date = parse_date(item.get("due_date", item.get("date", item.get("Due Date"))))
+        if due_date is None:
+            continue
+        amount_value = item.get("amount", item.get("principal_due", item.get("Amount", 0.0)))
+        try:
+            amount = float(amount_value)
+            if not np.isfinite(amount) or amount <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        raw_basis = str(item.get("basis", item.get("amount_basis", item.get("Amount Basis", "Dollar amount"))))
+        basis = ("% of original tranche" if raw_basis.strip().lower() in
+            ["% of original tranche", "percent", "percentage", "%", "pct"] else "Dollar amount")
+        rows.append({"due_date": due_date.isoformat(), "amount": amount, "basis": basis})
+    return sorted(rows, key=lambda row: (row["due_date"], row["basis"], row["amount"]))
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE
@@ -617,6 +662,21 @@ def build_schedule(params, actuals_map, drawdown_map):
     property_growth = float(params.get("pv_growth_annual", 3.0)) / 100.0
     covenant_lvr = float(params.get("covenant_lvr", 75.0))
     facility_type = normalize_facility_type(params.get("facility_type", "Construction"))
+    default_repayment_mode = default_principal_repayment_mode(facility_type)
+    principal_repayment_mode = str(params.get("principal_repayment_mode", default_repayment_mode))
+    if principal_repayment_mode not in PRINCIPAL_REPAYMENT_MODES:
+        principal_repayment_mode = default_repayment_mode
+    custom_principal_by_date = {}
+    if principal_repayment_mode == "Custom schedule":
+        valid_payment_dates = {add_months(settlement, month).isoformat() for month in range(1, term + 1)}
+        for repayment in parse_principal_repayment_rows(params.get("principal_repayment_schedule", [])):
+            due_date = repayment["due_date"]
+            if due_date not in valid_payment_dates:
+                continue
+            amount = float(repayment["amount"])
+            if repayment["basis"] == "% of original tranche":
+                amount = facility_amount * amount / 100.0
+            custom_principal_by_date[due_date] = custom_principal_by_date.get(due_date, 0.0) + max(0.0, amount)
     fees = compute_fees(params)
     raw_interest_treatment = str(params.get("interest_treatment", "Serviced")).strip().lower()
     interest_treatment = "Capitalised" if raw_interest_treatment in ["capitalised", "capitalized"] else "Serviced"
@@ -634,7 +694,7 @@ def build_schedule(params, actuals_map, drawdown_map):
         if interest_treatment == "Serviced" else 0.0)
     net_advance_interest_from_proceeds = (interest_treatment == "Serviced"
         and all_interest_in_advance
-        and facility_type in ["Bridge", "Residual Stock"])
+        and facility_type in ["Bridging", "Residual Stock"])
 
     rows = []
     balance = 0.0
@@ -702,9 +762,16 @@ def build_schedule(params, actuals_map, drawdown_map):
         if after_payoff:
             interest_accrued = 0.0
         elif interest_treatment == "Capitalised":
-            accrual_end = min(payment_date, period_payoff_date) if period_payoff_date else payment_date
-            interest_accrued = capitalised_interest_for_period(
-                balance_after_draw, draw_date, accrual_end, annual_rate, period_receipt_events)
+            if period_payoff_date:
+                # A payoff terminates accrual on its actual date. Partial principal receipts
+                # are otherwise applied to forecast balances at the payment anniversary.
+                interest_accrued = capitalised_interest_for_period(
+                    balance_after_draw, draw_date, min(payment_date, period_payoff_date),
+                    annual_rate, period_receipt_events)
+            else:
+                # Keep forecast-period interest through the scheduled anniversary; actual
+                # principal receipts reduce the balance for the next forecast period.
+                interest_accrued = balance_after_draw * annual_rate_for_days(annual_rate, days)
         else:
             interest_principal = facility_amount if index < advance_months else balance_after_draw
             interest_accrued = interest_principal * annual_rate_for_days(annual_rate, days)
@@ -732,7 +799,12 @@ def build_schedule(params, actuals_map, drawdown_map):
 
         smm = 1.0 - (1.0 - cpr) ** (days / 365.0) if cpr > 0 else 0.0
         prepayment = principal_base * smm if not after_payoff and not in_interest_only and principal_base > 0 else 0.0
-        if in_interest_only or after_payoff:
+        if after_payoff or principal_repayment_mode == "Bullet at maturity":
+            scheduled_principal = 0.0
+        elif principal_repayment_mode == "Custom schedule":
+            custom_due = custom_principal_by_date.get(payment_date.isoformat(), 0.0)
+            scheduled_principal = min(max(0.0, principal_base - prepayment), custom_due)
+        elif in_interest_only:
             scheduled_principal = 0.0
         else:
             remaining_payments = max(term - index, 1)
@@ -1467,7 +1539,7 @@ def load_deals():
         df["loan_ranking"] = df.apply(lambda row: safe_json(row.get("params_json"), {}).get(
             "loan_ranking", "Mezzanine" if row.get("facility_type") == "Mezzanine" else "Senior"), axis=1)
         df["facility_type"] = df["facility_type"].map(
-            lambda value: normalize_facility_type(value, fallback="Bridge"))
+            lambda value: normalize_facility_type(value, fallback="Bridging"))
     else:
         df["loan_ranking"] = pd.Series(dtype="object")
     return df
@@ -1479,6 +1551,8 @@ def save_deal(borrower_id, deal_name, facility, status, settlement, maturity,
     facility_type = normalize_facility_type(facility_type)
     params = dict(params or {})
     params["facility_type"] = facility_type
+    params.setdefault("principal_repayment_mode", default_principal_repayment_mode(facility_type))
+    params.setdefault("principal_repayment_schedule", [])
     conn = get_conn()
     conn.execute("""INSERT INTO deals (borrower_id, deal_name, facility_name, parent_deal_id,
         facility_amount, deal_status, settlement_date, maturity_date, facility_type,
@@ -1699,7 +1773,10 @@ def capital_calls_by_date(transactions_df):
 
 def update_deal_model(deal_id, params):
     params = dict(params or {})
-    params["facility_type"] = normalize_facility_type(params.get("facility_type", "Bridge"))
+    params["facility_type"] = normalize_facility_type(params.get("facility_type", "Bridging"))
+    params.setdefault("principal_repayment_mode",
+        default_principal_repayment_mode(params["facility_type"]))
+    params.setdefault("principal_repayment_schedule", [])
     conn = get_conn()
     conn.execute("""UPDATE deals SET facility_amount=?, settlement_date=?, maturity_date=?,
         facility_type=?, property_value=?, params_json=? WHERE id=?""",
@@ -1851,10 +1928,15 @@ def default_facility_model_params(facility_row):
     settlement = parse_date(params.get("settlement_date"), parse_date(facility_row.get("settlement_date"), date.today()))
     maturity = parse_date(params.get("maturity_date"), parse_date(facility_row.get("maturity_date"), add_months(settlement, 12)))
     term = max(1, min(120, int(params.get("term_months", infer_term_months(settlement, maturity)))))
+    facility_type = normalize_facility_type(params.get("facility_type",
+        facility_row.get("facility_type", "Bridging")))
+    principal_repayment_mode = str(params.get("principal_repayment_mode",
+        default_principal_repayment_mode(facility_type)))
+    if principal_repayment_mode not in PRINCIPAL_REPAYMENT_MODES:
+        principal_repayment_mode = default_principal_repayment_mode(facility_type)
     params.update({
         "facility_amount": float(params.get("facility_amount", facility_row.get("facility_amount", 0)) or 0),
-        "facility_type": normalize_facility_type(params.get("facility_type",
-            facility_row.get("facility_type", "Bridge"))),
+        "facility_type": facility_type,
         "property_value": float(params.get("property_value", facility_row.get("property_value", 0)) or 0),
         "settlement_date": settlement.isoformat(), "maturity_date": add_months(settlement, term).isoformat(),
         "term_months": term, "borrower_irr": float(params.get("borrower_irr", 12.0)),
@@ -1863,6 +1945,9 @@ def default_facility_model_params(facility_row):
             params.get("construction_months", min(6, term)))))),
         "drawdown_profile": str(params.get("drawdown_profile", "Automatic")),
         "s_curve_steepness": float(params.get("s_curve_steepness", 5.0)),
+        "principal_repayment_mode": principal_repayment_mode,
+        "principal_repayment_schedule": parse_principal_repayment_rows(
+            params.get("principal_repayment_schedule", [])),
         "loan_ranking": str(params.get("loan_ranking", facility_row.get("loan_ranking", "Senior"))),
         "interest_treatment": str(params.get("interest_treatment", "Serviced")),
         "interest_advance_months": params.get("interest_advance_months", 1),
@@ -2407,7 +2492,7 @@ def page_modeler():
     st.markdown(f"### {deal_row['deal_name']}  ·  {deal_row['facility_name']}  ·  {deal_row['borrower_name']}")
     st.caption(f"Tranche ID {deal_id}  |  Ranking: {loan_ranking_default}  |  Status: {deal_row['deal_status']}  |  Security: {deal_row['security_type']}")
     if legacy_facility_type_unknown and not legacy_mezzanine_type:
-        st.warning(f"Legacy facility type ‘{facility_type_raw}’ is no longer available. This deal is being treated as Bridge; choose Construction or Residual Stock if that is more appropriate, then save.")
+        st.warning(f"Legacy facility type ‘{facility_type_raw}’ is no longer available. This deal is being treated as Bridging; choose Construction or Residual Stock if that is more appropriate, then save.")
     st.markdown('<div class="section-note">Edit assumptions or drawdowns once. All schedules, investor allocations, economics and cashflows below recalculate from the current inputs. Save changes from the Overview tab to persist them.</div>',
                 unsafe_allow_html=True)
 
@@ -2475,7 +2560,7 @@ def page_modeler():
             interest_advance_setting = "All" if interest_advance_all else int(interest_advance_months)
             net_advance_interest_from_proceeds = (interest_treatment == "Serviced"
                 and str(interest_advance_setting).strip().lower() == "all"
-                and normalize_facility_type(facility_type) in ["Bridge", "Residual Stock"])
+                and normalize_facility_type(facility_type) in ["Bridging", "Residual Stock"])
             if interest_treatment == "Capitalised":
                 st.caption("Capitalised interest accrues using actual days, is added to principal, and has no cash interest due. The advance setting above is not applied.")
             else:
@@ -2499,7 +2584,87 @@ def page_modeler():
                 help="Construction drawdown and line-fee period. Only applies to Construction facilities.")
             interest_only_months = c8.number_input("Principal grace period (months)", min_value=0,
                 max_value=int(term_months), step=1, key=prefix + "interest_only_months",
-                help="Monthly principal repayments are deferred for this period. With Serviced interest, scheduled payments remain interest-only; Capitalised interest continues accruing.")
+                help="Used by Standard amortising and CPR projections. Custom repayment dates take precedence; Bullet mode has no scheduled principal before maturity.")
+
+            principal_mode_key = prefix + "principal_repayment_mode"
+            principal_mode_type_key = prefix + "principal_repayment_default_type"
+            previous_mode_type = st.session_state.get(principal_mode_type_key)
+            if previous_mode_type is None:
+                # A hot-reloaded session may retain the former hard-coded Standard default
+                # for an unsaved legacy Bridging facility; correct it unless a custom mode
+                # was already selected or a mode has been persisted to the deal.
+                if ("principal_repayment_mode" not in existing_params
+                        and st.session_state.get(principal_mode_key) == "Standard amortising"
+                        and default_principal_repayment_mode(facility_type) == "Bullet at maturity"):
+                    st.session_state[principal_mode_key] = "Bullet at maturity"
+                st.session_state[principal_mode_type_key] = facility_type
+            elif previous_mode_type != facility_type:
+                current_mode = st.session_state.get(principal_mode_key,
+                    existing_params.get("principal_repayment_mode",
+                        default_principal_repayment_mode(previous_mode_type)))
+                if current_mode == default_principal_repayment_mode(previous_mode_type):
+                    st.session_state[principal_mode_key] = default_principal_repayment_mode(facility_type)
+                st.session_state[principal_mode_type_key] = facility_type
+            principal_mode_default = str(existing_params.get("principal_repayment_mode",
+                default_principal_repayment_mode(facility_type)))
+            init_widget_state(principal_mode_key, principal_mode_default)
+            if st.session_state[principal_mode_key] not in PRINCIPAL_REPAYMENT_MODES:
+                st.session_state[principal_mode_key] = default_principal_repayment_mode(facility_type)
+            principal_repayment_mode = st.selectbox("Principal repayment pattern",
+                PRINCIPAL_REPAYMENT_MODES, key=prefix + "principal_repayment_mode",
+                help="Bridging facilities default to one maturity bullet. Residual Stock defaults to its standard equal-principal schedule. All facility types can use a custom schedule.")
+
+            forecast_principal_dates = [add_months(settlement, month) for month in range(1, int(term_months) + 1)]
+            principal_date_labels = {due.strftime("%d %b %Y"): due.isoformat()
+                for due in forecast_principal_dates}
+            stored_principal_rows = parse_principal_repayment_rows(
+                existing_params.get("principal_repayment_schedule", []))
+            principal_editor_rows = []
+            for repayment in stored_principal_rows:
+                due = parse_date(repayment["due_date"])
+                label = due.strftime("%d %b %Y") if due else ""
+                if label in principal_date_labels:
+                    principal_editor_rows.append({"Due date": label,
+                        "Amount basis": repayment["basis"], "Amount": repayment["amount"]})
+            principal_editor_df = pd.DataFrame(principal_editor_rows,
+                columns=["Due date", "Amount basis", "Amount"])
+            principal_editor_fingerprint = hashlib.sha1(
+                f"{settlement.isoformat()}|{int(term_months)}".encode("utf-8")).hexdigest()[:8]
+            principal_editor_key = prefix + "principal_schedule_" + principal_editor_fingerprint
+            with st.expander("Custom principal repayments", expanded=principal_repayment_mode == "Custom schedule"):
+                st.caption("Forecast repayments are scheduled on the monthly settlement anniversaries. Choose either dollars or a percentage of the original tranche on each row. Any remaining principal is due at maturity. Actual receipts keep their actual value date; forecast-period interest continues through the scheduled anniversary.")
+                edited_principal_plan = st.data_editor(principal_editor_df,
+                    key=principal_editor_key, num_rows="dynamic", hide_index=True,
+                    use_container_width=True, disabled=principal_repayment_mode != "Custom schedule",
+                    column_config={
+                        "Due date": st.column_config.SelectboxColumn("Forecast due date",
+                            options=list(principal_date_labels.keys()), required=True),
+                        "Amount basis": st.column_config.SelectboxColumn("Amount basis",
+                            options=PRINCIPAL_REPAYMENT_BASES, default="Dollar amount", required=True),
+                        "Amount": st.column_config.NumberColumn("Amount", min_value=0.0,
+                            step=1000.0, format="%.2f", default=0.0, required=True),
+                    })
+            principal_repayment_schedule = []
+            for _, repayment_row in edited_principal_plan.iterrows():
+                due_value = repayment_row.get("Due date", "")
+                due_label = "" if pd.isna(due_value) else str(due_value).strip()
+                due_iso = principal_date_labels.get(due_label)
+                try:
+                    amount = float(repayment_row.get("Amount", 0.0))
+                    if not np.isfinite(amount) or amount <= 0:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                basis_value = repayment_row.get("Amount basis", "Dollar amount")
+                basis = "Dollar amount" if pd.isna(basis_value) else str(basis_value).strip()
+                if due_iso and basis in PRINCIPAL_REPAYMENT_BASES:
+                    principal_repayment_schedule.append({"due_date": due_iso,
+                        "amount": amount, "basis": basis})
+            principal_repayment_schedule = sorted(principal_repayment_schedule,
+                key=lambda item: (item["due_date"], item["basis"], item["amount"]))
+            if principal_repayment_mode == "Custom schedule" and not principal_repayment_schedule:
+                st.info("Add one or more principal repayments above. Until then, the outstanding balance will be due at maturity.")
+
             init_widget_state(prefix + "borrower_irr", float(existing_params.get("borrower_irr", 12.0)))
             borrower_irr = c9.number_input("Borrower rate (% p.a.)", min_value=0.0, max_value=50.0,
                 step=0.25, key=prefix + "borrower_irr")
@@ -2518,7 +2683,7 @@ def page_modeler():
                 st.session_state[prefix + "drawdown_profile"] = "Full at settlement"
             drawdown_profile = c11.selectbox("Default drawdown profile", profile_options,
                 key=prefix + "drawdown_profile", disabled=facility_type != "Construction",
-                help="Construction can use an S-curve or straight-line schedule. Bridge and Residual Stock draw in full at settlement.")
+                help="Construction can use an S-curve or straight-line schedule. Bridging and Residual Stock draw in full at settlement.")
             init_widget_state(prefix + "s_curve_steepness", float(existing_params.get("s_curve_steepness", 5.0)))
             s_curve_active = (facility_type == "Construction"
                 and drawdown_profile in ["Automatic", "S-curve"])
@@ -2665,7 +2830,7 @@ def page_modeler():
             init_widget_state(prefix + "line_fee_pct", float(existing_params.get("line_fee_pct", 0.5)))
             line_fee_pct = f2.number_input("Undrawn line fee (% p.a.)", min_value=0.0, max_value=5.0,
                 step=0.1, key=prefix + "line_fee_pct", disabled=facility_type != "Construction",
-                help="Construction-only fee on undrawn facility balance. It is not charged for Bridge or Residual Stock.")
+                help="Construction-only fee on undrawn facility balance. It is not charged for Bridging or Residual Stock.")
             init_widget_state(prefix + "admin_fee_monthly", float(existing_params.get("admin_fee_monthly", 500.0)))
             admin_fee_monthly = f3.number_input("Admin fee per payment date", min_value=0.0, max_value=5_000.0,
                 step=50.0, key=prefix + "admin_fee_monthly")
@@ -2711,6 +2876,8 @@ def page_modeler():
         "investor_return_rates": investor_return_rates,
         "construction_months": int(construction_months),
         "interest_only_months": int(interest_only_months),
+        "principal_repayment_mode": principal_repayment_mode,
+        "principal_repayment_schedule": principal_repayment_schedule,
         "borrower_irr": float(borrower_irr),
         "cpr": float(cpr), "drawdown_profile": drawdown_profile,
         "s_curve_steepness": float(s_curve_steepness), "loan_ranking": loan_ranking,
@@ -2756,7 +2923,7 @@ def page_modeler():
                     unsafe_allow_html=True)
         st.caption("Investor Ledger rows use Capital Call movements recorded in the Investor Portal. Forecast rows default to the Senior/Mezz split. Choose Manual to override a row; the model checks each row against the net funding amount after upfront fee netting.")
         if net_advance_interest_from_proceeds:
-            st.info("For this all-term Serviced Bridge / Residual Stock facility, investor funding remains gross draw less upfront fees. Prepaid interest is withheld separately from the borrower’s initial proceeds in the Loan Schedule.")
+            st.info("For this all-term Serviced Bridging / Residual Stock facility, investor funding remains gross draw less upfront fees. Prepaid interest is withheld separately from the borrower’s initial proceeds in the Loan Schedule.")
 
         reset_clicked = st.button("Reset to suggested schedule", key=prefix + "reset_drawdown_button")
         if reset_clicked:
@@ -2898,7 +3065,7 @@ def page_modeler():
         if interest_treatment == "Capitalised":
             st.caption("Capitalised interest accrues on ACT/365 and is added to principal; it is not shown as cash interest due.")
         elif net_advance_interest_from_proceeds:
-            st.caption("All-term serviced interest for this Bridge / Residual Stock facility is withheld from the initial proceeds. It is shown separately from cash interest due and is not charged again on the settlement date.")
+            st.caption("All-term serviced interest for this Bridging / Residual Stock facility is withheld from the initial proceeds. It is shown separately from cash interest due and is not charged again on the settlement date.")
 
         display_cols = ["Drawdown_Date", "Payment_Date", "Drawdown_Gross", "Upfront_Fees_Deducted",
             "Advance_Interest_Withheld", "Investor_Funding", "Drawdown_Net", "Opening_Balance",
@@ -2955,7 +3122,7 @@ def page_modeler():
     # ── Actuals and arrears ─────────────────────────────────────
     with tabs[4]:
         st.subheader("Actual payments and arrears")
-        st.markdown('<div class="section-note">Select a payment anniversary and log actual collections. Logged principal and drawdown overrides feed through to the outstanding balance and investor principal ledger; unpaid interest remains separate arrears, while fees and principal shortfalls are not added to principal.</div>',
+        st.markdown('<div class="section-note">Select a forecast payment anniversary and log actual collections. For receipts on a different value date, record them in Borrower Servicing so the actual principal movement is dated correctly. Forecast-period interest still runs through the scheduled anniversary; the reduced balance carries into the next forecast period. Unpaid interest remains separate arrears, while fees and principal shortfalls are not added to principal.</div>',
                     unsafe_allow_html=True)
         payment_dates = [parse_date(value) for value in schedule_df["Payment_Date"].tolist()]
         selected_payment_date = st.selectbox("Payment / anniversary date", payment_dates,
@@ -3201,7 +3368,7 @@ def page_borrower_servicing():
     parent_id = root_labels[root_label]
     root_row = roots[roots["id"] == parent_id].iloc[0]
     facilities = deals[deals["parent_deal_id"] == parent_id].copy()
-    st.caption("Routine receipt interest is calculated through each tranche’s last settlement anniversary. For a payoff, enter an interest-through date; the selected minimum prepaid period remains due, with excess advance interest credited.")
+    st.caption("Record each receipt on its actual value date. Forecast repayment and interest periods remain anchored to settlement anniversaries: partial actual principal reduces the balance for the next forecast period, while current-period forecast interest continues through the anniversary. For a payoff, enter an interest-through date; the selected minimum prepaid period remains due, with excess advance interest credited.")
 
     c1, c2, c3 = st.columns(3)
     receipt_date = c1.date_input("Receipt / value date", value=date.today(), key=f"receipt_date_{parent_id}")
