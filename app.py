@@ -164,6 +164,21 @@ def safe_json(value, fallback=None):
     except (TypeError, json.JSONDecodeError):
         return fallback
 
+
+FACILITY_TYPES = ["Construction", "Bridge", "Residual Stock"]
+
+
+def normalize_facility_type(value, fallback="Bridge"):
+    """Normalize legacy facility labels to the three supported facility types."""
+    label = str(value or "").strip().lower()
+    aliases = {
+        "construction": "Construction",
+        "bridge": "Bridge",
+        "bridging": "Bridge",
+        "residual stock": "Residual Stock",
+    }
+    return aliases.get(label, fallback)
+
 # ═══════════════════════════════════════════════════════════════
 # DATABASE
 # ═══════════════════════════════════════════════════════════════
@@ -335,14 +350,16 @@ def calc_xirr(cashflows):
 
 
 def resolve_drawdown_profile(facility_type, requested_profile):
-    if requested_profile != "Automatic":
-        return requested_profile
-    if facility_type == "Construction":
+    facility_type = normalize_facility_type(facility_type)
+    requested_profile = str(requested_profile or "Automatic")
+    # Staged construction profiles (including S-curve) are only valid for Construction.
+    if facility_type != "Construction":
+        return "Full at settlement"
+    if requested_profile == "Automatic":
         return "S-curve"
-    if facility_type == "Revolving":
-        return "Straight-line"
-    # Bridging, residual stock, residential, term and mezzanine default to a single settlement draw.
-    return "Full at settlement"
+    if requested_profile in ["Full at settlement", "S-curve", "Straight-line"]:
+        return requested_profile
+    return "S-curve"
 
 
 def make_s_curve_weights(count, steepness=5.0):
@@ -384,7 +401,7 @@ def build_drawdown_template(settlement, term, facility_amount, facility_type,
 
 def drawdown_signature(deal_id, facility_amount, facility_type, settlement,
                        term, construction_months, profile, steepness):
-    payload = "|".join(map(str, [deal_id, round(float(facility_amount), 2), facility_type,
+    payload = "|".join(map(str, [deal_id, round(float(facility_amount), 2), normalize_facility_type(facility_type),
         parse_date(settlement).isoformat(), int(term), int(construction_months),
         profile, round(float(steepness), 2)]))
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:14]
@@ -547,8 +564,11 @@ def compute_fees(params):
     facility_amount = float(params.get("facility_amount", 0))
     term = int(params.get("term_months", 12))
     construction_months = int(params.get("construction_months", 6))
+    facility_type = normalize_facility_type(params.get("facility_type", "Construction"))
+    is_construction = facility_type == "Construction"
     establishment = facility_amount * float(params.get("estab_fee_pct", 1.5)) / 100.0
-    line_rate = float(params.get("line_fee_pct", 0.5)) / 100.0
+    # Undrawn line fees only apply to Construction facilities.
+    line_rate = float(params.get("line_fee_pct", 0.5)) / 100.0 if is_construction else 0.0
     admin_monthly = float(params.get("admin_fee_monthly", 500))
     legal = float(params.get("legal_fee", 3500))
     risk = float(params.get("risk_review_fee", 2500))
@@ -587,14 +607,16 @@ def read_drawdown_map(params):
 def build_schedule(params, actuals_map, drawdown_map):
     facility_amount = float(params.get("facility_amount", 0))
     term = max(1, int(params.get("term_months", 12)))
-    construction_months = int(params.get("construction_months", 6))
+    construction_months = max(0, int(params.get("construction_months", 6)))
+    interest_only_months = max(0, min(term, int(params.get(
+        "interest_only_months", params.get("construction_months", 6)))))
     settlement = parse_date(params.get("settlement_date"), date.today())
     annual_rate = float(params.get("borrower_irr", 12.0)) / 100.0
     cpr = float(params.get("cpr", 0.0)) / 100.0
     property_value = float(params.get("property_value", 0.0))
     property_growth = float(params.get("pv_growth_annual", 3.0)) / 100.0
     covenant_lvr = float(params.get("covenant_lvr", 75.0))
-    facility_type = str(params.get("facility_type", ""))
+    facility_type = normalize_facility_type(params.get("facility_type", "Construction"))
     fees = compute_fees(params)
     raw_interest_treatment = str(params.get("interest_treatment", "Serviced")).strip().lower()
     interest_treatment = "Capitalised" if raw_interest_treatment in ["capitalised", "capitalized"] else "Serviced"
@@ -612,7 +634,7 @@ def build_schedule(params, actuals_map, drawdown_map):
         if interest_treatment == "Serviced" else 0.0)
     net_advance_interest_from_proceeds = (interest_treatment == "Serviced"
         and all_interest_in_advance
-        and facility_type.strip().lower() in ["bridging", "residual stock"])
+        and facility_type in ["Bridge", "Residual Stock"])
 
     rows = []
     balance = 0.0
@@ -698,17 +720,19 @@ def build_schedule(params, actuals_map, drawdown_map):
         balance_after_capitalisation = balance_after_draw + capitalised_interest
         principal_base = balance_after_capitalisation
 
-        # Unpaid serviced interest remains separate arrears; capitalised interest is principal.
+        # Construction timing controls construction drawdowns/fees; principal grace is independent.
         arrears_opening = arrears
-        in_construction = index < construction_months
+        in_construction = facility_type == "Construction" and index < construction_months
+        in_interest_only = index < interest_only_months
         undrawn = max(facility_amount - cumulative_drawn, 0.0)
-        line_fee = undrawn * fees["line_fee_rate"] * (days / 365.0) if in_construction and not after_payoff else 0.0
+        line_fee = (undrawn * fees["line_fee_rate"] * (days / 365.0)
+                    if in_construction and not after_payoff else 0.0)
         admin_fee = fees["admin_monthly"] if not after_payoff else 0.0
         discharge_fee = fees["discharge"] if index == term - 1 and not after_payoff else 0.0
 
         smm = 1.0 - (1.0 - cpr) ** (days / 365.0) if cpr > 0 else 0.0
-        prepayment = principal_base * smm if not after_payoff and not in_construction and principal_base > 0 else 0.0
-        if in_construction or after_payoff:
+        prepayment = principal_base * smm if not after_payoff and not in_interest_only and principal_base > 0 else 0.0
+        if in_interest_only or after_payoff:
             scheduled_principal = 0.0
         else:
             remaining_payments = max(term - index, 1)
@@ -867,6 +891,7 @@ def build_schedule(params, actuals_map, drawdown_map):
             "Cum_Interest": cumulative_interest,
             "Cum_Drawn": cumulative_drawn,
             "Is_Construction": in_construction,
+            "Is_Interest_Only": in_interest_only,
         })
         balance = ending_balance
 
@@ -1441,6 +1466,8 @@ def load_deals():
     if not df.empty:
         df["loan_ranking"] = df.apply(lambda row: safe_json(row.get("params_json"), {}).get(
             "loan_ranking", "Mezzanine" if row.get("facility_type") == "Mezzanine" else "Senior"), axis=1)
+        df["facility_type"] = df["facility_type"].map(
+            lambda value: normalize_facility_type(value, fallback="Bridge"))
     else:
         df["loan_ranking"] = pd.Series(dtype="object")
     return df
@@ -1449,6 +1476,9 @@ def load_deals():
 def save_deal(borrower_id, deal_name, facility, status, settlement, maturity,
               facility_type, security_type, property_value, params,
               facility_name="Tranche 1", parent_deal_id=None):
+    facility_type = normalize_facility_type(facility_type)
+    params = dict(params or {})
+    params["facility_type"] = facility_type
     conn = get_conn()
     conn.execute("""INSERT INTO deals (borrower_id, deal_name, facility_name, parent_deal_id,
         facility_amount, deal_status, settlement_date, maturity_date, facility_type,
@@ -1668,6 +1698,8 @@ def capital_calls_by_date(transactions_df):
 
 
 def update_deal_model(deal_id, params):
+    params = dict(params or {})
+    params["facility_type"] = normalize_facility_type(params.get("facility_type", "Bridge"))
     conn = get_conn()
     conn.execute("""UPDATE deals SET facility_amount=?, settlement_date=?, maturity_date=?,
         facility_type=?, property_value=?, params_json=? WHERE id=?""",
@@ -1821,11 +1853,14 @@ def default_facility_model_params(facility_row):
     term = max(1, min(120, int(params.get("term_months", infer_term_months(settlement, maturity)))))
     params.update({
         "facility_amount": float(params.get("facility_amount", facility_row.get("facility_amount", 0)) or 0),
-        "facility_type": str(params.get("facility_type", facility_row.get("facility_type", "Term Loan")) or "Term Loan"),
+        "facility_type": normalize_facility_type(params.get("facility_type",
+            facility_row.get("facility_type", "Bridge"))),
         "property_value": float(params.get("property_value", facility_row.get("property_value", 0)) or 0),
         "settlement_date": settlement.isoformat(), "maturity_date": add_months(settlement, term).isoformat(),
         "term_months": term, "borrower_irr": float(params.get("borrower_irr", 12.0)),
-        "construction_months": int(params.get("construction_months", min(6, term))),
+        "construction_months": max(0, int(params.get("construction_months", min(6, term)))),
+        "interest_only_months": max(0, min(term, int(params.get("interest_only_months",
+            params.get("construction_months", min(6, term)))))),
         "drawdown_profile": str(params.get("drawdown_profile", "Automatic")),
         "s_curve_steepness": float(params.get("s_curve_steepness", 5.0)),
         "loan_ranking": str(params.get("loan_ranking", facility_row.get("loan_ranking", "Senior"))),
@@ -2185,7 +2220,6 @@ def page_borrowers():
 # PAGE: DEALS
 # ═══════════════════════════════════════════════════════════════
 
-FACILITY_TYPES = ["Construction", "Bridging", "Residual Stock", "Residential", "Term Loan", "Revolving"]
 SECURITY_TYPES = ["First Mortgage", "Second Mortgage", "Unsecured", "Personal Guarantee", "Other"]
 
 
@@ -2363,14 +2397,17 @@ def page_modeler():
     facility_default = float(existing_params.get("facility_amount", deal_row.get("facility_amount", 0)) or 0)
     property_default = float(existing_params.get("property_value", deal_row.get("property_value", 0)) or 0)
     facility_type_raw = str(existing_params.get("facility_type", deal_row.get("facility_type", "Construction")) or "Construction")
-    legacy_mezzanine_type = facility_type_raw == "Mezzanine"
-    facility_type_default = facility_type_raw if facility_type_raw in FACILITY_TYPES else "Term Loan"
+    legacy_mezzanine_type = facility_type_raw.strip().lower() == "mezzanine"
+    facility_type_default = normalize_facility_type(facility_type_raw)
+    legacy_facility_type_unknown = normalize_facility_type(facility_type_raw, fallback=None) is None
     loan_ranking_default = str(existing_params.get("loan_ranking", "Mezzanine" if legacy_mezzanine_type else "Senior"))
     if loan_ranking_default not in ["Senior", "Mezzanine"]:
         loan_ranking_default = "Senior"
 
     st.markdown(f"### {deal_row['deal_name']}  ·  {deal_row['facility_name']}  ·  {deal_row['borrower_name']}")
     st.caption(f"Tranche ID {deal_id}  |  Ranking: {loan_ranking_default}  |  Status: {deal_row['deal_status']}  |  Security: {deal_row['security_type']}")
+    if legacy_facility_type_unknown and not legacy_mezzanine_type:
+        st.warning(f"Legacy facility type ‘{facility_type_raw}’ is no longer available. This deal is being treated as Bridge; choose Construction or Residual Stock if that is more appropriate, then save.")
     st.markdown('<div class="section-note">Edit assumptions or drawdowns once. All schedules, investor allocations, economics and cashflows below recalculate from the current inputs. Save changes from the Overview tab to persist them.</div>',
                 unsafe_allow_html=True)
 
@@ -2386,6 +2423,8 @@ def page_modeler():
             st.subheader("Tranche terms and timeline")
             c1, c2, c3 = st.columns(3)
             init_widget_state(prefix + "facility_type", facility_type_default)
+            if st.session_state[prefix + "facility_type"] not in FACILITY_TYPES:
+                st.session_state[prefix + "facility_type"] = facility_type_default
             facility_type = c1.selectbox("Facility type", FACILITY_TYPES, key=prefix + "facility_type")
             init_widget_state(prefix + "facility_amount", facility_default)
             facility_amount = c2.number_input("Facility amount", min_value=0.0, max_value=10_000_000_000.0,
@@ -2436,7 +2475,7 @@ def page_modeler():
             interest_advance_setting = "All" if interest_advance_all else int(interest_advance_months)
             net_advance_interest_from_proceeds = (interest_treatment == "Serviced"
                 and str(interest_advance_setting).strip().lower() == "all"
-                and facility_type.strip().lower() in ["bridging", "residual stock"])
+                and normalize_facility_type(facility_type) in ["Bridge", "Residual Stock"])
             if interest_treatment == "Capitalised":
                 st.caption("Capitalised interest accrues using actual days, is added to principal, and has no cash interest due. The advance setting above is not applied.")
             else:
@@ -2447,29 +2486,47 @@ def page_modeler():
             init_widget_state(prefix + "construction_months", construction_default)
             if st.session_state[prefix + "construction_months"] > int(term_months):
                 st.session_state[prefix + "construction_months"] = int(term_months)
+            interest_only_default = int(existing_params.get("interest_only_months", construction_default))
+            interest_only_default = max(0, min(int(term_months), interest_only_default))
+            init_widget_state(prefix + "interest_only_months", interest_only_default)
+            if st.session_state[prefix + "interest_only_months"] > int(term_months):
+                st.session_state[prefix + "interest_only_months"] = int(term_months)
+
             c7, c8, c9 = st.columns(3)
-            construction_months = c7.number_input("Interest-only / construction periods", min_value=0,
+            construction_months = c7.number_input("Construction period (months)", min_value=0,
                 max_value=int(term_months), step=1, key=prefix + "construction_months",
-                help="The construction flag controls the drawdown curve and when scheduled principal begins.")
+                disabled=facility_type != "Construction",
+                help="Construction drawdown and line-fee period. Only applies to Construction facilities.")
+            interest_only_months = c8.number_input("Principal grace period (months)", min_value=0,
+                max_value=int(term_months), step=1, key=prefix + "interest_only_months",
+                help="Monthly principal repayments are deferred for this period. With Serviced interest, scheduled payments remain interest-only; Capitalised interest continues accruing.")
             init_widget_state(prefix + "borrower_irr", float(existing_params.get("borrower_irr", 12.0)))
-            borrower_irr = c8.number_input("Borrower rate (% p.a.)", min_value=0.0, max_value=50.0,
+            borrower_irr = c9.number_input("Borrower rate (% p.a.)", min_value=0.0, max_value=50.0,
                 step=0.25, key=prefix + "borrower_irr")
-            init_widget_state(prefix + "cpr", float(existing_params.get("cpr", 0.0)))
-            cpr = c9.number_input("Annual prepayment rate / CPR (%)", min_value=0.0, max_value=50.0,
-                step=0.5, key=prefix + "cpr")
 
             c10, c11, c12 = st.columns(3)
+            init_widget_state(prefix + "cpr", float(existing_params.get("cpr", 0.0)))
+            cpr = c10.number_input("Annual prepayment rate / CPR (%)", min_value=0.0, max_value=50.0,
+                step=0.5, key=prefix + "cpr")
             init_widget_state(prefix + "drawdown_profile", str(existing_params.get("drawdown_profile", "Automatic")))
-            profile_options = ["Automatic", "Full at settlement", "S-curve", "Straight-line"]
-            if st.session_state[prefix + "drawdown_profile"] not in profile_options:
-                st.session_state[prefix + "drawdown_profile"] = "Automatic"
-            drawdown_profile = c10.selectbox("Default drawdown profile", profile_options,
-                key=prefix + "drawdown_profile", help="Automatic: Construction uses an S-curve, Revolving uses straight-line, other types draw at settlement.")
+            if facility_type == "Construction":
+                profile_options = ["Automatic", "Full at settlement", "S-curve", "Straight-line"]
+                if st.session_state[prefix + "drawdown_profile"] not in profile_options:
+                    st.session_state[prefix + "drawdown_profile"] = "Automatic"
+            else:
+                profile_options = ["Full at settlement"]
+                st.session_state[prefix + "drawdown_profile"] = "Full at settlement"
+            drawdown_profile = c11.selectbox("Default drawdown profile", profile_options,
+                key=prefix + "drawdown_profile", disabled=facility_type != "Construction",
+                help="Construction can use an S-curve or straight-line schedule. Bridge and Residual Stock draw in full at settlement.")
             init_widget_state(prefix + "s_curve_steepness", float(existing_params.get("s_curve_steepness", 5.0)))
-            s_curve_steepness = c11.slider("S-curve shape", min_value=1.0, max_value=9.0, step=0.5,
-                key=prefix + "s_curve_steepness", help="Higher values concentrate construction draws around the middle of the build period.")
+            s_curve_active = (facility_type == "Construction"
+                and drawdown_profile in ["Automatic", "S-curve"])
+            s_curve_steepness = c12.slider("S-curve shape", min_value=1.0, max_value=9.0, step=0.5,
+                key=prefix + "s_curve_steepness", disabled=not s_curve_active,
+                help="Construction-only: higher values concentrate draws around the middle of the build period.")
             initial_security_type = str(deal_row.get("security_type", "First Mortgage") or "First Mortgage")
-            c12.text_input("Security type", value=initial_security_type, disabled=True)
+            st.caption(f"Security type: {initial_security_type}")
 
         with setup_tabs[1]:
             st.subheader("Loan ranking and investors")
@@ -2607,7 +2664,8 @@ def page_modeler():
                 step=0.25, key=prefix + "estab_fee_pct")
             init_widget_state(prefix + "line_fee_pct", float(existing_params.get("line_fee_pct", 0.5)))
             line_fee_pct = f2.number_input("Undrawn line fee (% p.a.)", min_value=0.0, max_value=5.0,
-                step=0.1, key=prefix + "line_fee_pct")
+                step=0.1, key=prefix + "line_fee_pct", disabled=facility_type != "Construction",
+                help="Construction-only fee on undrawn facility balance. It is not charged for Bridge or Residual Stock.")
             init_widget_state(prefix + "admin_fee_monthly", float(existing_params.get("admin_fee_monthly", 500.0)))
             admin_fee_monthly = f3.number_input("Admin fee per payment date", min_value=0.0, max_value=5_000.0,
                 step=50.0, key=prefix + "admin_fee_monthly")
@@ -2651,7 +2709,9 @@ def page_modeler():
         "investor_return_overrides_version": 2,
         "investor_return_overrides": investor_return_overrides,
         "investor_return_rates": investor_return_rates,
-        "construction_months": int(construction_months), "borrower_irr": float(borrower_irr),
+        "construction_months": int(construction_months),
+        "interest_only_months": int(interest_only_months),
+        "borrower_irr": float(borrower_irr),
         "cpr": float(cpr), "drawdown_profile": drawdown_profile,
         "s_curve_steepness": float(s_curve_steepness), "loan_ranking": loan_ranking,
         "estab_fee_pct": float(estab_fee_pct),
@@ -2696,7 +2756,7 @@ def page_modeler():
                     unsafe_allow_html=True)
         st.caption("Investor Ledger rows use Capital Call movements recorded in the Investor Portal. Forecast rows default to the Senior/Mezz split. Choose Manual to override a row; the model checks each row against the net funding amount after upfront fee netting.")
         if net_advance_interest_from_proceeds:
-            st.info("For this all-term Serviced Bridging / Residual Stock facility, investor funding remains gross draw less upfront fees. Prepaid interest is withheld separately from the borrower’s initial proceeds in the Loan Schedule.")
+            st.info("For this all-term Serviced Bridge / Residual Stock facility, investor funding remains gross draw less upfront fees. Prepaid interest is withheld separately from the borrower’s initial proceeds in the Loan Schedule.")
 
         reset_clicked = st.button("Reset to suggested schedule", key=prefix + "reset_drawdown_button")
         if reset_clicked:
@@ -2838,7 +2898,7 @@ def page_modeler():
         if interest_treatment == "Capitalised":
             st.caption("Capitalised interest accrues on ACT/365 and is added to principal; it is not shown as cash interest due.")
         elif net_advance_interest_from_proceeds:
-            st.caption("All-term serviced interest for this Bridging / Residual Stock facility is withheld from the initial proceeds. It is shown separately from cash interest due and is not charged again on the settlement date.")
+            st.caption("All-term serviced interest for this Bridge / Residual Stock facility is withheld from the initial proceeds. It is shown separately from cash interest due and is not charged again on the settlement date.")
 
         display_cols = ["Drawdown_Date", "Payment_Date", "Drawdown_Gross", "Upfront_Fees_Deducted",
             "Advance_Interest_Withheld", "Investor_Funding", "Drawdown_Net", "Opening_Balance",
