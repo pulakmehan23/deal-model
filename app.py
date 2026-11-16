@@ -140,6 +140,18 @@ def percent(value, decimals=2):
         return "—"
 
 
+def safe_rate_pct(value, fallback=8.0):
+    try:
+        rate = float(value)
+        if not np.isfinite(rate):
+            raise ValueError("non-finite return")
+    except (TypeError, ValueError):
+        rate = float(fallback)
+    if not np.isfinite(rate):
+        rate = 8.0
+    return max(0.0, min(50.0, rate))
+
+
 def safe_json(value, fallback=None):
     if fallback is None:
         fallback = {}
@@ -194,7 +206,8 @@ def init_db():
     conn.execute("""CREATE TABLE IF NOT EXISTS deal_investors (
         deal_id INTEGER NOT NULL, investor_id INTEGER NOT NULL,
         senior_default_pct REAL DEFAULT 0, mezz_default_pct REAL DEFAULT 0,
-        target_irr REAL, is_active INTEGER DEFAULT 1,
+        target_irr REAL, senior_target_irr REAL, mezz_target_irr REAL,
+        is_active INTEGER DEFAULT 1,
         PRIMARY KEY (deal_id, investor_id),
         FOREIGN KEY (deal_id) REFERENCES deals(id),
         FOREIGN KEY (investor_id) REFERENCES investors(id))""")
@@ -238,6 +251,10 @@ def init_db():
     deal_investor_cols = {row[1] for row in conn.execute("PRAGMA table_info(deal_investors)").fetchall()}
     if "target_irr" not in deal_investor_cols:
         conn.execute("ALTER TABLE deal_investors ADD COLUMN target_irr REAL")
+    if "senior_target_irr" not in deal_investor_cols:
+        conn.execute("ALTER TABLE deal_investors ADD COLUMN senior_target_irr REAL")
+    if "mezz_target_irr" not in deal_investor_cols:
+        conn.execute("ALTER TABLE deal_investors ADD COLUMN mezz_target_irr REAL")
 
     investor_cols = {row[1] for row in conn.execute("PRAGMA table_info(investors)").fetchall()}
     if "target_irr" not in investor_cols:
@@ -249,6 +266,11 @@ def init_db():
     conn.execute("""UPDATE investors SET
         senior_target_irr=COALESCE(senior_target_irr, target_irr, 8.0),
         mezz_target_irr=COALESCE(mezz_target_irr, target_irr, 8.0)""")
+    conn.execute("""UPDATE deal_investors SET
+        senior_target_irr=COALESCE(senior_target_irr,
+            (SELECT senior_target_irr FROM investors WHERE investors.id=deal_investors.investor_id), 8.0),
+        mezz_target_irr=COALESCE(mezz_target_irr,
+            (SELECT mezz_target_irr FROM investors WHERE investors.id=deal_investors.investor_id), 8.0)""")
     transaction_cols = {row[1] for row in conn.execute("PRAGMA table_info(investor_transactions)").fetchall()}
     if "source" not in transaction_cols:
         conn.execute("ALTER TABLE investor_transactions ADD COLUMN source TEXT DEFAULT 'User'")
@@ -890,7 +912,9 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
             override = return_overrides.get(str(investor_id), return_overrides.get(investor_id, {}))
             override = override if isinstance(override, dict) else {}
             override_rate = override.get("senior" if loan_ranking == "Senior" else "mezzanine")
-            row_rate = investor_row.get(return_column, investor_row.get("target_irr", default_target_pct))
+            deal_return_column = "deal_senior_target_irr" if loan_ranking == "Senior" else "deal_mezz_target_irr"
+            row_rate = investor_row.get(deal_return_column,
+                investor_row.get(return_column, investor_row.get("target_irr", default_target_pct)))
             candidate = return_rates.get(name, override_rate if override_rate is not None else row_rate)
             try:
                 target_pct = float(candidate if candidate is not None else default_target_pct)
@@ -1448,8 +1472,22 @@ def save_additional_facility(parent_deal_id, facility_name, facility_amount, sta
     conn.close()
     if not parent:
         raise ValueError("Parent deal was not found.")
-    return save_deal(parent[0], parent[1], facility_amount, status, settlement, maturity,
+    new_id = save_deal(parent[0], parent[1], facility_amount, status, settlement, maturity,
         facility_type, security_type, property_value, params, facility_name, int(parent_deal_id))
+    # New tranches inherit the deal-specific return defaults from Tranche 1,
+    # while keeping their own independent assignment rows and later overrides.
+    conn = get_conn()
+    conn.execute("""UPDATE deal_investors SET
+        senior_target_irr=COALESCE((SELECT parent.senior_target_irr FROM deal_investors AS parent
+            WHERE parent.deal_id=? AND parent.investor_id=deal_investors.investor_id AND parent.is_active=1),
+            senior_target_irr),
+        mezz_target_irr=COALESCE((SELECT parent.mezz_target_irr FROM deal_investors AS parent
+            WHERE parent.deal_id=? AND parent.investor_id=deal_investors.investor_id AND parent.is_active=1),
+            mezz_target_irr)
+        WHERE deal_id=?""", (int(parent_deal_id), int(parent_deal_id), int(new_id)))
+    conn.commit()
+    conn.close()
+    return new_id
 
 
 def standard_split_for(investor_name, loan_ranking):
@@ -1462,12 +1500,15 @@ def ensure_default_deal_investors(deal_id):
     conn = get_conn()
     core_defaults = {"BPCFMC": (50.0, 80.0), "BPCFLC": (15.0, 20.0), "CBCF": (35.0, 0.0)}
     for name, (senior_pct, mezz_pct) in core_defaults.items():
-        investor = conn.execute("SELECT id, target_irr FROM investors WHERE name=?", (name,)).fetchone()
+        investor = conn.execute("""SELECT id, target_irr, senior_target_irr, mezz_target_irr
+            FROM investors WHERE name=?""", (name,)).fetchone()
         if investor:
             conn.execute("""INSERT OR IGNORE INTO deal_investors
-                (deal_id, investor_id, senior_default_pct, mezz_default_pct, target_irr, is_active)
-                VALUES (?,?,?,?,?,1)""", (int(deal_id), int(investor[0]), senior_pct, mezz_pct,
-                                               float(investor[1] or 8.0)))
+                (deal_id, investor_id, senior_default_pct, mezz_default_pct, target_irr,
+                 senior_target_irr, mezz_target_irr, is_active)
+                VALUES (?,?,?,?,?,?,?,1)""", (int(deal_id), int(investor[0]), senior_pct, mezz_pct,
+                float(investor[1] if investor[1] is not None else 8.0),
+                safe_rate_pct(investor[2], 8.0), safe_rate_pct(investor[3], 8.0)))
     conn.commit()
     conn.close()
 
@@ -1486,8 +1527,10 @@ def load_deal_investors(deal_id):
     df = pd.read_sql("""SELECT i.id, i.name, i.investor_type,
         COALESCE(di.target_irr, i.target_irr) AS target_irr,
         COALESCE(i.senior_target_irr, i.target_irr, 8.0) AS senior_target_irr,
-        COALESCE(i.mezz_target_irr, i.target_irr, 8.0) AS mezz_target_irr, i.status,
-        di.senior_default_pct, di.mezz_default_pct
+        COALESCE(i.mezz_target_irr, i.target_irr, 8.0) AS mezz_target_irr,
+        COALESCE(di.senior_target_irr, i.senior_target_irr, i.target_irr, 8.0) AS deal_senior_target_irr,
+        COALESCE(di.mezz_target_irr, i.mezz_target_irr, i.target_irr, 8.0) AS deal_mezz_target_irr,
+        i.status, di.senior_default_pct, di.mezz_default_pct
         FROM deal_investors di JOIN investors i ON i.id=di.investor_id
         WHERE di.deal_id=? AND di.is_active=1 AND i.status='Active' ORDER BY i.name""",
         conn, params=(int(deal_id),))
@@ -1521,28 +1564,61 @@ def update_investor(investor_id, name, investor_type, target_irr, status, notes=
     conn.close()
 
 
-def save_deal_investors(deal_id, investor_ids, target_returns=None):
+def save_deal_investors(deal_id, investor_ids, target_returns=None,
+                        senior_target_returns=None, mezz_target_returns=None):
     conn = get_conn()
-    conn.execute("UPDATE deal_investors SET is_active=0 WHERE deal_id=?", (int(deal_id),))
+    deal_id = int(deal_id)
+    conn.execute("UPDATE deal_investors SET is_active=0 WHERE deal_id=?", (deal_id,))
     defaults = {"BPCFMC": (50.0, 80.0), "BPCFLC": (15.0, 20.0), "CBCF": (35.0, 0.0)}
     target_returns = target_returns or {}
+    senior_target_returns = senior_target_returns or {}
+    mezz_target_returns = mezz_target_returns or {}
+    parent_row = conn.execute("SELECT parent_deal_id FROM deals WHERE id=?", (deal_id,)).fetchone()
+    parent_deal_id = int(parent_row[0]) if parent_row and parent_row[0] is not None else deal_id
     for investor_id in investor_ids:
-        investor = conn.execute("SELECT name, target_irr FROM investors WHERE id=?", (int(investor_id),)).fetchone()
+        investor_id = int(investor_id)
+        investor = conn.execute("""SELECT name, target_irr, senior_target_irr, mezz_target_irr
+            FROM investors WHERE id=?""", (investor_id,)).fetchone()
         if not investor:
             continue
-        name, global_target = investor
+        name, global_target, global_senior, global_mezz = investor
         senior_pct, mezz_pct = defaults.get(name, (0.0, 0.0))
-        existing = conn.execute("SELECT target_irr FROM deal_investors WHERE deal_id=? AND investor_id=?",
-                                 (int(deal_id), int(investor_id))).fetchone()
-        target = target_returns.get(int(investor_id))
+        existing = conn.execute("""SELECT target_irr, senior_target_irr, mezz_target_irr
+            FROM deal_investors WHERE deal_id=? AND investor_id=?""",
+            (deal_id, investor_id)).fetchone()
+        parent_defaults = None
+        if parent_deal_id != deal_id:
+            parent_defaults = conn.execute("""SELECT senior_target_irr, mezz_target_irr
+                FROM deal_investors WHERE deal_id=? AND investor_id=? AND is_active=1""",
+                (parent_deal_id, investor_id)).fetchone()
+        target = target_returns.get(investor_id)
         if target is None:
-            target = (existing[0] if existing and existing[0] is not None else global_target or 8.0)
+            target = existing[0] if existing and existing[0] is not None else global_target
+        try:
+            target = float(target if target is not None else 8.0)
+            if not np.isfinite(target):
+                target = 8.0
+        except (TypeError, ValueError):
+            target = 8.0
+        senior_value = senior_target_returns.get(investor_id)
+        if senior_value is None:
+            senior_value = (existing[1] if existing and existing[1] is not None else
+                parent_defaults[0] if parent_defaults and parent_defaults[0] is not None else global_senior)
+        mezz_value = mezz_target_returns.get(investor_id)
+        if mezz_value is None:
+            mezz_value = (existing[2] if existing and existing[2] is not None else
+                parent_defaults[1] if parent_defaults and parent_defaults[1] is not None else global_mezz)
+        senior_value = safe_rate_pct(senior_value, 8.0)
+        mezz_value = safe_rate_pct(mezz_value, 8.0)
         conn.execute("""INSERT INTO deal_investors
-            (deal_id, investor_id, senior_default_pct, mezz_default_pct, target_irr, is_active)
-            VALUES (?,?,?,?,?,1)
+            (deal_id, investor_id, senior_default_pct, mezz_default_pct, target_irr,
+             senior_target_irr, mezz_target_irr, is_active)
+            VALUES (?,?,?,?,?,?,?,1)
             ON CONFLICT(deal_id, investor_id) DO UPDATE SET is_active=1,
-                target_irr=excluded.target_irr""",
-            (int(deal_id), int(investor_id), senior_pct, mezz_pct, float(target)))
+                target_irr=excluded.target_irr,
+                senior_target_irr=excluded.senior_target_irr,
+                mezz_target_irr=excluded.mezz_target_irr""",
+            (deal_id, investor_id, senior_pct, mezz_pct, float(target), senior_value, mezz_value))
     conn.commit()
     conn.close()
 
@@ -2267,6 +2343,14 @@ def page_modeler():
     stored_return_overrides = safe_json(existing_params.get("investor_return_overrides", {}), {})
     if not isinstance(stored_return_overrides, dict):
         stored_return_overrides = {}
+    legacy_shared_return_mode = "investor_target_irr" in existing_params
+    if legacy_shared_return_mode:
+        stored_return_overrides = {}  # The superseded facility-wide rate must not override deal defaults.
+    try:
+        return_override_version = int(existing_params.get("investor_return_overrides_version", 0) or 0)
+    except (TypeError, ValueError):
+        return_override_version = 0
+    legacy_return_snapshot = return_override_version < 2 and not legacy_shared_return_mode
     investor_transactions_df = load_investor_transactions(deal_id)
     actual_capital_calls = capital_calls_by_date(investor_transactions_df)
 
@@ -2399,26 +2483,27 @@ def page_modeler():
                 st.info("Senior default: BPCFMC 50% · BPCFLC 15% · CBCF 35%. Optional investors are 0% until you allocate them on a row.")
             else:
                 st.info("Mezzanine default: BPCFMC 80% · BPCFLC 20%. CBCF is not included by default; optional investors can be attached and allocated when needed.")
-            st.caption("Each investor has separate Senior and Mezzanine target-return defaults. Set global defaults in Investor Portal; override either rate for this tranche in the table.")
+            st.caption("Each investor has separate Senior and Mezzanine deal-return defaults. Edit them per deal in Investor Portal → Deal Assignments; override either rate for this tranche in the table.")
             return_rows = []
             for _, investor_row in deal_investors_df.iterrows():
                 investor_id = int(investor_row["id"])
                 stored = stored_return_overrides.get(str(investor_id), stored_return_overrides.get(investor_id, {}))
-                stored = stored if isinstance(stored, dict) else {}
-                try:
-                    senior_default = float(investor_row.get("senior_target_irr", 8.0))
-                    if not np.isfinite(senior_default):
-                        senior_default = 8.0
-                except (TypeError, ValueError):
-                    senior_default = 8.0
-                try:
-                    mezz_default = float(investor_row.get("mezz_target_irr", 8.0))
-                    if not np.isfinite(mezz_default):
-                        mezz_default = 8.0
-                except (TypeError, ValueError):
-                    mezz_default = 8.0
-                senior_default = max(0.0, min(50.0, senior_default))
-                mezz_default = max(0.0, min(50.0, mezz_default))
+                stored = dict(stored) if isinstance(stored, dict) else {}
+                senior_default = safe_rate_pct(investor_row.get("deal_senior_target_irr",
+                    investor_row.get("senior_target_irr", 8.0)), 8.0)
+                mezz_default = safe_rate_pct(investor_row.get("deal_mezz_target_irr",
+                    investor_row.get("mezz_target_irr", 8.0)), 8.0)
+                if legacy_return_snapshot and stored:
+                    global_senior = safe_rate_pct(investor_row.get("senior_target_irr", 8.0), 8.0)
+                    global_mezz = safe_rate_pct(investor_row.get("mezz_target_irr", 8.0), 8.0)
+                    try:
+                        if abs(float(stored.get("senior", float("nan"))) - global_senior) < 1e-8:
+                            stored.pop("senior", None)
+                        if abs(float(stored.get("mezzanine", stored.get("mezz", float("nan")))) - global_mezz) < 1e-8:
+                            stored.pop("mezzanine", None)
+                            stored.pop("mezz", None)
+                    except (TypeError, ValueError):
+                        pass
                 if stored:
                     senior_rate = stored.get("senior", senior_default)
                     mezz_rate = stored.get("mezzanine", stored.get("mezz", mezz_default))
@@ -2453,7 +2538,10 @@ def page_modeler():
                 "Mezzanine return (% p.a.)", "Applied return (% p.a.)"]
             return_matrix = pd.DataFrame(return_rows, columns=return_columns)
             return_fingerprint = hashlib.sha1(str(sorted(return_matrix["Investor ID"].astype(int).tolist())).encode()).hexdigest()[:8]
-            return_editor_key = prefix + "investor_returns_matrix_" + return_fingerprint
+            return_rate_signature = return_matrix[["Investor ID", "Senior return (% p.a.)",
+                "Mezzanine return (% p.a.)"]].to_json(orient="records")
+            return_rate_fingerprint = hashlib.sha1(return_rate_signature.encode()).hexdigest()[:8]
+            return_editor_key = prefix + "investor_returns_matrix_" + return_fingerprint + "_" + return_rate_fingerprint
             edited_returns = st.data_editor(return_matrix, key=return_editor_key, hide_index=True,
                 use_container_width=True, num_rows="fixed", column_config={
                     "Investor ID": st.column_config.NumberColumn("Investor ID", disabled=True),
@@ -2467,8 +2555,14 @@ def page_modeler():
                         min_value=0.0, max_value=50.0, step=0.25, format="%.2f", required=True),
                     "Applied return (% p.a.)": st.column_config.NumberColumn("Applied return (% p.a.)", disabled=True),
                 })
-            investor_return_overrides = {}
+            investor_return_overrides = dict(stored_return_overrides)
             investor_return_rates = {}
+            deal_defaults_by_id = {}
+            for _, investor_row in deal_investors_df.iterrows():
+                investor_id = int(investor_row["id"])
+                deal_defaults_by_id[investor_id] = (
+                    safe_rate_pct(investor_row.get("deal_senior_target_irr", investor_row.get("senior_target_irr", 8.0))),
+                    safe_rate_pct(investor_row.get("deal_mezz_target_irr", investor_row.get("mezz_target_irr", 8.0))))
             return_defaults_by_id = {int(row["Investor ID"]): row for _, row in return_matrix.iterrows()}
             for _, return_row in edited_returns.iterrows():
                 investor_id = int(return_row["Investor ID"])
@@ -2488,8 +2582,16 @@ def page_modeler():
                 senior_rate = max(0.0, min(50.0, senior_rate))
                 mezz_rate = max(0.0, min(50.0, mezz_rate))
                 selected_rate = senior_rate if loan_ranking == "Senior" else mezz_rate
-                investor_return_overrides[str(investor_id)] = {
-                    "senior": senior_rate, "mezzanine": mezz_rate}
+                investor_return_overrides.pop(str(investor_id), None)
+                investor_return_overrides.pop(investor_id, None)
+                base_senior, base_mezz = deal_defaults_by_id.get(investor_id, (8.0, 8.0))
+                tranche_override = {}
+                if abs(senior_rate - base_senior) > 1e-8:
+                    tranche_override["senior"] = senior_rate
+                if abs(mezz_rate - base_mezz) > 1e-8:
+                    tranche_override["mezzanine"] = mezz_rate
+                if tranche_override:
+                    investor_return_overrides[str(investor_id)] = tranche_override
                 investor_return_rates[str(return_row["Investor"])] = selected_rate
             if not deal_investors_df.empty:
                 deal_investors_df = deal_investors_df.copy()
@@ -2546,6 +2648,7 @@ def page_modeler():
         "interest_treatment": interest_treatment,
         "interest_advance_months": interest_advance_setting,
         "default_investor_target_irr": 8.0,
+        "investor_return_overrides_version": 2,
         "investor_return_overrides": investor_return_overrides,
         "investor_return_rates": investor_return_rates,
         "construction_months": int(construction_months), "borrower_irr": float(borrower_irr),
@@ -3181,7 +3284,7 @@ def transaction_balances(transactions_df, as_of=None):
 
 def page_investor_portal():
     st.title("Investor Portal")
-    st.caption("Internal investor register, deal assignments and dated movement ledger. Optional investors such as CBFM or Syndicate are attached only to the deals where they participate.")
+    st.caption("Investor Register return rates are global starting defaults; set deal-specific Senior and Mezzanine rates under Deal Assignments. Optional investors are attached only to the tranches where they participate.")
     investor_tabs = st.tabs(["Investor Register", "Deal Assignments", "Record Movement", "Activity & Balances"])
 
     # Register investors
@@ -3298,24 +3401,44 @@ def page_investor_portal():
             st.session_state[assignment_key] = current_ids
         selected_ids = st.multiselect("Investors attached to this tranche", list(investor_labels.keys()),
             key=assignment_key, format_func=lambda value: investor_labels.get(int(value), str(value)))
-        assignment_deal = deals[deals["id"] == assignment_deal_id].iloc[0]
-        assignment_params = safe_json(assignment_deal.get("params_json", "{}"), {})
-        assignment_ranking = str(assignment_params.get("loan_ranking", "Senior"))
-        st.caption(f"Investor returns are set individually for Senior and Mezzanine on each tranche. The {assignment_ranking} rate applies here; edit the per-investor rates in Deal Workspace → Returns & Allocation.")
-        if st.button("Save tranche investor assignments", type="primary",
-                     key=f"save_assignments_{assignment_deal_id}"):
-            save_deal_investors(assignment_deal_id, selected_ids)
-            st.success("Tranche investor assignments were saved.")
-            st.rerun()
+        st.caption("Set investor return defaults for this selected tranche/deal here. They can differ on another deal; Investor Register rates seed new assignments. Newly added tranches inherit the parent deal’s current defaults, with independent overrides available in Deal Workspace.")
+        edited_assignment = pd.DataFrame(columns=["Investor ID", "Investor", "Type",
+            "Senior allocation default (%)", "Mezzanine allocation default (%)",
+            "Senior deal return (% p.a.)", "Mezzanine deal return (% p.a.)"])
         if not current_assignment.empty:
-            assignment_view = current_assignment[["name", "investor_type", "senior_default_pct", "mezz_default_pct",
-                "senior_target_irr", "mezz_target_irr"]].rename(columns={
-                "name": "Investor", "investor_type": "Type",
-                "senior_default_pct": "Senior allocation default (%)",
-                "mezz_default_pct": "Mezzanine allocation default (%)",
-                "senior_target_irr": "Senior return default (% p.a.)",
-                "mezz_target_irr": "Mezzanine return default (% p.a.)"})
-            st.dataframe(assignment_view, use_container_width=True, hide_index=True)
+            assignment_view = pd.DataFrame({
+                "Investor ID": current_assignment["id"].astype(int),
+                "Investor": current_assignment["name"].astype(str),
+                "Type": current_assignment["investor_type"].astype(str),
+                "Senior allocation default (%)": pd.to_numeric(current_assignment["senior_default_pct"], errors="coerce").fillna(0.0),
+                "Mezzanine allocation default (%)": pd.to_numeric(current_assignment["mezz_default_pct"], errors="coerce").fillna(0.0),
+                "Senior deal return (% p.a.)": current_assignment["deal_senior_target_irr"].map(safe_rate_pct),
+                "Mezzanine deal return (% p.a.)": current_assignment["deal_mezz_target_irr"].map(safe_rate_pct),
+            })
+            assignment_fingerprint = hashlib.sha1(str(sorted(assignment_view["Investor ID"].tolist())).encode()).hexdigest()[:8]
+            edited_assignment = st.data_editor(assignment_view,
+                key=f"deal_return_matrix_{assignment_deal_id}_{assignment_fingerprint}",
+                hide_index=True, use_container_width=True, num_rows="fixed", column_config={
+                    "Investor ID": st.column_config.NumberColumn("Investor ID", disabled=True),
+                    "Investor": st.column_config.TextColumn("Investor", disabled=True),
+                    "Type": st.column_config.TextColumn("Type", disabled=True),
+                    "Senior allocation default (%)": st.column_config.NumberColumn("Senior allocation default (%)", disabled=True),
+                    "Mezzanine allocation default (%)": st.column_config.NumberColumn("Mezzanine allocation default (%)", disabled=True),
+                    "Senior deal return (% p.a.)": st.column_config.NumberColumn("Senior deal return (% p.a.)",
+                        min_value=0.0, max_value=50.0, step=0.25, format="%.2f", required=True),
+                    "Mezzanine deal return (% p.a.)": st.column_config.NumberColumn("Mezzanine deal return (% p.a.)",
+                        min_value=0.0, max_value=50.0, step=0.25, format="%.2f", required=True),
+                })
+        if st.button("Save tranche assignments and deal returns", type="primary",
+                     key=f"save_assignments_{assignment_deal_id}"):
+            senior_rates = {int(row["Investor ID"]): safe_rate_pct(row["Senior deal return (% p.a.)"])
+                for _, row in edited_assignment.iterrows()}
+            mezz_rates = {int(row["Investor ID"]): safe_rate_pct(row["Mezzanine deal return (% p.a.)"])
+                for _, row in edited_assignment.iterrows()}
+            save_deal_investors(assignment_deal_id, selected_ids,
+                senior_target_returns=senior_rates, mezz_target_returns=mezz_rates)
+            st.success("Tranche assignments and deal-specific returns were saved.")
+            st.rerun()
 
     # Record actual movements; buyouts are entered as a single total with a user-defined seller split.
     with investor_tabs[2]:
