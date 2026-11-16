@@ -172,7 +172,7 @@ def init_db():
         status TEXT DEFAULT 'Active')""")
     conn.execute("""CREATE TABLE IF NOT EXISTS deals (
         id INTEGER PRIMARY KEY AUTOINCREMENT, borrower_id INTEGER, deal_name TEXT,
-        facility_name TEXT DEFAULT 'Facility 1', parent_deal_id INTEGER,
+        facility_name TEXT DEFAULT 'Tranche 1', parent_deal_id INTEGER,
         facility_amount REAL, deal_status TEXT DEFAULT 'Pipeline',
         settlement_date TEXT, maturity_date TEXT, facility_type TEXT DEFAULT 'Construction',
         security_type TEXT DEFAULT 'First Mortgage', property_value REAL DEFAULT 0,
@@ -189,6 +189,7 @@ def init_db():
     conn.execute("""CREATE TABLE IF NOT EXISTS investors (
         id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
         investor_type TEXT DEFAULT 'Fund', target_irr REAL DEFAULT 8.0,
+        senior_target_irr REAL DEFAULT 8.0, mezz_target_irr REAL DEFAULT 8.0,
         status TEXT DEFAULT 'Active', notes TEXT DEFAULT '')""")
     conn.execute("""CREATE TABLE IF NOT EXISTS deal_investors (
         deal_id INTEGER NOT NULL, investor_id INTEGER NOT NULL,
@@ -221,10 +222,16 @@ def init_db():
 
     deal_cols = {row[1] for row in conn.execute("PRAGMA table_info(deals)").fetchall()}
     if "facility_name" not in deal_cols:
-        conn.execute("ALTER TABLE deals ADD COLUMN facility_name TEXT DEFAULT 'Facility 1'")
+        conn.execute("ALTER TABLE deals ADD COLUMN facility_name TEXT DEFAULT 'Tranche 1'")
     if "parent_deal_id" not in deal_cols:
         conn.execute("ALTER TABLE deals ADD COLUMN parent_deal_id INTEGER")
-    conn.execute("UPDATE deals SET facility_name='Facility 1' WHERE facility_name IS NULL OR TRIM(facility_name)=''")
+    conn.execute("UPDATE deals SET facility_name='Tranche 1' WHERE facility_name IS NULL OR TRIM(facility_name)=''")
+    for legacy_id, legacy_name in conn.execute("SELECT id, facility_name FROM deals").fetchall():
+        legacy_parts = str(legacy_name or "").strip().split()
+        if (len(legacy_parts) == 2 and legacy_parts[0].lower() == "facility"
+                and legacy_parts[1].isdigit()):
+            conn.execute("UPDATE deals SET facility_name=? WHERE id=?",
+                (f"Tranche {int(legacy_parts[1])}", int(legacy_id)))
     conn.execute("UPDATE deals SET parent_deal_id=id WHERE parent_deal_id IS NULL")
     conn.execute("CREATE INDEX IF NOT EXISTS ix_deals_parent ON deals(parent_deal_id)")
 
@@ -235,6 +242,13 @@ def init_db():
     investor_cols = {row[1] for row in conn.execute("PRAGMA table_info(investors)").fetchall()}
     if "target_irr" not in investor_cols:
         conn.execute("ALTER TABLE investors ADD COLUMN target_irr REAL DEFAULT 8.0")
+    if "senior_target_irr" not in investor_cols:
+        conn.execute("ALTER TABLE investors ADD COLUMN senior_target_irr REAL")
+    if "mezz_target_irr" not in investor_cols:
+        conn.execute("ALTER TABLE investors ADD COLUMN mezz_target_irr REAL")
+    conn.execute("""UPDATE investors SET
+        senior_target_irr=COALESCE(senior_target_irr, target_irr, 8.0),
+        mezz_target_irr=COALESCE(mezz_target_irr, target_irr, 8.0)""")
     transaction_cols = {row[1] for row in conn.execute("PRAGMA table_info(investor_transactions)").fetchall()}
     if "source" not in transaction_cols:
         conn.execute("ALTER TABLE investor_transactions ADD COLUMN source TEXT DEFAULT 'User'")
@@ -242,7 +256,9 @@ def init_db():
     # The three core pools are available on every deal. Optional investors such as
     # CBFM or Syndicate are added in the Investor Portal and attached deal-by-deal.
     for core_name in ("BPCFMC", "BPCFLC", "CBCF"):
-        conn.execute("INSERT OR IGNORE INTO investors (name, investor_type, target_irr) VALUES (?, 'Fund', 8.0)", (core_name,))
+        conn.execute("""INSERT OR IGNORE INTO investors
+            (name, investor_type, target_irr, senior_target_irr, mezz_target_irr)
+            VALUES (?, 'Fund', 8.0, 8.0, 8.0)""", (core_name,))
 
     # Backwards-compatible migration from the earlier month-number actuals table.
     actual_cols = {row[1] for row in conn.execute("PRAGMA table_info(actuals)").fetchall()}
@@ -839,7 +855,7 @@ def build_schedule(params, actuals_map, drawdown_map):
 # ═══════════════════════════════════════════════════════════════
 def build_investor_ledger(schedule_df, params, investors_df, transactions_df=None,
                           borrower_receipt_allocations_df=None):
-    """Build investor economics, applying facility-specific returns and actual receipt splits."""
+    """Build investor economics using each investor's rate for the tranche ranking."""
     transactions_df = transactions_df if transactions_df is not None else pd.DataFrame()
     borrower_receipt_allocations_df = (borrower_receipt_allocations_df
         if borrower_receipt_allocations_df is not None else pd.DataFrame())
@@ -854,14 +870,35 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
             if period_date is not None:
                 receipt_events_by_period.setdefault(period_date.isoformat(), []).append(receipt_row)
     investor_names = investors_df["name"].astype(str).tolist() if not investors_df.empty else []
+    loan_ranking = str(params.get("loan_ranking", "Senior"))
+    return_column = "senior_target_irr" if loan_ranking == "Senior" else "mezz_target_irr"
     try:
-        shared_target_pct = float(params.get("investor_target_irr", 8.0))
-        if not np.isfinite(shared_target_pct):
-            shared_target_pct = 8.0
+        default_target_pct = float(params.get("default_investor_target_irr", 8.0))
+        if not np.isfinite(default_target_pct):
+            default_target_pct = 8.0
     except (TypeError, ValueError):
-        shared_target_pct = 8.0
-    shared_target_rate = shared_target_pct / 100.0
-    target_rates = {name: shared_target_rate for name in investor_names}
+        default_target_pct = 8.0
+    return_rates = params.get("investor_return_rates", {})
+    return_rates = return_rates if isinstance(return_rates, dict) else {}
+    return_overrides = params.get("investor_return_overrides", {})
+    return_overrides = return_overrides if isinstance(return_overrides, dict) else {}
+    target_rates = {}
+    if not investors_df.empty:
+        for _, investor_row in investors_df.iterrows():
+            name = str(investor_row["name"])
+            investor_id = investor_row.get("id", None)
+            override = return_overrides.get(str(investor_id), return_overrides.get(investor_id, {}))
+            override = override if isinstance(override, dict) else {}
+            override_rate = override.get("senior" if loan_ranking == "Senior" else "mezzanine")
+            row_rate = investor_row.get(return_column, investor_row.get("target_irr", default_target_pct))
+            candidate = return_rates.get(name, override_rate if override_rate is not None else row_rate)
+            try:
+                target_pct = float(candidate if candidate is not None else default_target_pct)
+                if not np.isfinite(target_pct):
+                    target_pct = default_target_pct
+            except (TypeError, ValueError):
+                target_pct = default_target_pct
+            target_rates[name] = target_pct / 100.0
 
     # Keep historical transaction counterparties and any legacy allocation names visible.
     if not transactions_df.empty:
@@ -881,8 +918,9 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
                 for name in raw:
                     if str(name) not in investor_names:
                         investor_names.append(str(name))
+    default_target_rate = default_target_pct / 100.0
     for name in investor_names:
-        target_rates.setdefault(name, shared_target_rate)
+        target_rates.setdefault(name, default_target_rate)
 
     balances = {name: 0.0 for name in investor_names}
     total_funded = {name: 0.0 for name in investor_names}
@@ -891,7 +929,6 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
     cashflows = {name: [] for name in investor_names}
     cashflow_events = []
     period_events = [[] for _ in range(len(schedule_df))]
-    loan_ranking = str(params.get("loan_ranking", "Senior"))
 
     def record_flow(name, flow_date, flow_type, amount, signed_amount):
         amount = max(0.0, float(amount))
@@ -978,7 +1015,7 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
             days = max((until_date - cursor).days, 0)
             for investor_name in list(balances):
                 accrued_interest[investor_name] = accrued_interest.get(investor_name, 0.0) + balances[investor_name] * annual_rate_for_days(
-                    target_rates.get(investor_name, shared_target_rate), days)
+                    target_rates.get(investor_name, default_target_rate), days)
             cursor = until_date
 
         period_events[period_index].sort(key=lambda event: (event[0], event[1]))
@@ -1052,7 +1089,7 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
         period_receipts = receipt_events_by_period.get(payment_date.isoformat(), [])
         schedule_actual_penalty = schedule_row.get("Actual_Penalty_Interest")
         if has_schedule_actual_interest:
-            # Interest earned follows each investor's facility-specific target return. Borrower
+            # Interest earned follows each investor's ranking-specific target return. Borrower
             # receipt components separately determine dated cash distributions to investors.
             for name in list(balances):
                 interest_by_investor[name] = accrued_interest.get(name, 0.0)
@@ -1192,7 +1229,7 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
             "Total_Interest_Earned": total_interest.get(name, 0.0),
             "Total_Principal_Returned": total_principal_returned.get(name, 0.0),
             "Outstanding_Balance": balances.get(name, 0.0),
-            "Target_XIRR": target_rates.get(name, shared_target_rate) * 100.0,
+            "Target_XIRR": target_rates.get(name, default_target_rate) * 100.0,
             "Actual_XIRR": calc_xirr(cashflows.get(name, [])) * 100.0,
         })
     summary_df = pd.DataFrame(summary_rows, columns=["Investor", "Total_Funded", "Total_Interest_Earned",
@@ -1387,7 +1424,7 @@ def load_deals():
 
 def save_deal(borrower_id, deal_name, facility, status, settlement, maturity,
               facility_type, security_type, property_value, params,
-              facility_name="Facility 1", parent_deal_id=None):
+              facility_name="Tranche 1", parent_deal_id=None):
     conn = get_conn()
     conn.execute("""INSERT INTO deals (borrower_id, deal_name, facility_name, parent_deal_id,
         facility_amount, deal_status, settlement_date, maturity_date, facility_type,
@@ -1447,7 +1484,9 @@ def load_deal_investors(deal_id):
     ensure_default_deal_investors(deal_id)
     conn = get_conn()
     df = pd.read_sql("""SELECT i.id, i.name, i.investor_type,
-        COALESCE(di.target_irr, i.target_irr) AS target_irr, i.status,
+        COALESCE(di.target_irr, i.target_irr) AS target_irr,
+        COALESCE(i.senior_target_irr, i.target_irr, 8.0) AS senior_target_irr,
+        COALESCE(i.mezz_target_irr, i.target_irr, 8.0) AS mezz_target_irr, i.status,
         di.senior_default_pct, di.mezz_default_pct
         FROM deal_investors di JOIN investors i ON i.id=di.investor_id
         WHERE di.deal_id=? AND di.is_active=1 AND i.status='Active' ORDER BY i.name""",
@@ -1456,18 +1495,28 @@ def load_deal_investors(deal_id):
     return df
 
 
-def save_investor(name, investor_type, target_irr=8.0, notes=""):
+def save_investor(name, investor_type, target_irr=8.0, notes="",
+                  senior_target_irr=None, mezz_target_irr=None):
+    senior_rate = float(target_irr if senior_target_irr is None else senior_target_irr)
+    mezz_rate = float(target_irr if mezz_target_irr is None else mezz_target_irr)
     conn = get_conn()
-    conn.execute("INSERT INTO investors (name, investor_type, target_irr, notes) VALUES (?,?,?,?)",
-                 (name.strip(), investor_type, float(target_irr), notes.strip()))
+    conn.execute("""INSERT INTO investors
+        (name, investor_type, target_irr, senior_target_irr, mezz_target_irr, notes)
+        VALUES (?,?,?,?,?,?)""",
+        (name.strip(), investor_type, float(target_irr), senior_rate, mezz_rate, notes.strip()))
     conn.commit()
     conn.close()
 
 
-def update_investor(investor_id, name, investor_type, target_irr, status, notes=""):
+def update_investor(investor_id, name, investor_type, target_irr, status, notes="",
+                    senior_target_irr=None, mezz_target_irr=None):
+    senior_rate = float(target_irr if senior_target_irr is None else senior_target_irr)
+    mezz_rate = float(target_irr if mezz_target_irr is None else mezz_target_irr)
     conn = get_conn()
-    conn.execute("""UPDATE investors SET name=?, investor_type=?, target_irr=?, status=?, notes=?
-        WHERE id=?""", (name.strip(), investor_type, float(target_irr), status, notes.strip(), int(investor_id)))
+    conn.execute("""UPDATE investors SET name=?, investor_type=?, target_irr=?,
+        senior_target_irr=?, mezz_target_irr=?, status=?, notes=? WHERE id=?""",
+        (name.strip(), investor_type, float(target_irr), senior_rate, mezz_rate,
+         status, notes.strip(), int(investor_id)))
     conn.commit()
     conn.close()
 
@@ -1986,7 +2035,7 @@ def page_dashboard():
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Borrowers", len(borrowers))
     c2.metric("Deals", len(root_deals))
-    c3.metric("Total Facilities", money(total_facility))
+    c3.metric("Total Tranche Exposure", money(total_facility))
     c4.metric("Active / Pipeline", f"{active} / {pipeline}")
 
     if deals.empty:
@@ -2016,8 +2065,8 @@ def page_dashboard():
     recent_cols = ["id", "borrower_name", "deal_name", "facility_name", "facility_type", "facility_amount",
                    "deal_status", "settlement_date", "maturity_date"]
     recent = deals[[column for column in recent_cols if column in deals.columns]].head(10).copy()
-    recent = recent.rename(columns={"id": "Facility ID", "borrower_name": "Borrower", "deal_name": "Deal",
-        "facility_name": "Facility", "facility_type": "Facility Type", "facility_amount": "Facility Amount", "deal_status": "Status",
+    recent = recent.rename(columns={"id": "Tranche ID", "borrower_name": "Borrower", "deal_name": "Deal",
+        "facility_name": "Tranche", "facility_type": "Facility Type", "facility_amount": "Tranche Amount", "deal_status": "Status",
         "settlement_date": "Settlement", "maturity_date": "Maturity"})
     st.dataframe(recent, use_container_width=True, hide_index=True)
 
@@ -2064,36 +2113,50 @@ FACILITY_TYPES = ["Construction", "Bridging", "Residual Stock", "Residential", "
 SECURITY_TYPES = ["First Mortgage", "Second Mortgage", "Unsecured", "Personal Guarantee", "Other"]
 
 
+def next_tranche_number(deals_df, parent_deal_id):
+    """Return the next sequential tranche number for a deal, with no configured ceiling."""
+    if deals_df is None or deals_df.empty:
+        return 1
+    members = deals_df[deals_df["parent_deal_id"] == int(parent_deal_id)]
+    if members.empty:
+        return 1
+    numbers = []
+    for label in members.get("facility_name", pd.Series(dtype=str)).fillna("").astype(str):
+        parts = label.strip().split()
+        if len(parts) >= 2 and parts[-2].lower() in {"tranche", "facility"} and parts[-1].isdigit():
+            numbers.append(int(parts[-1]))
+    return max(max(numbers, default=0), len(members)) + 1
+
+
 def page_deals():
     st.title("Deals")
-    st.caption("Create facilities here, then manage assumptions and servicing in Deal Workspace.")
+    st.caption("Create a deal with Senior Tranche 1, then add Senior or Mezzanine tranches one at a time. Manage each tranche in Deal Workspace.")
     borrowers = load_borrowers()
     if borrowers.empty:
         st.warning("Add a borrower before creating a deal.")
         return
 
-    with st.expander("＋ Create deal", expanded=False):
+    with st.expander("＋ Create deal · Senior Tranche 1", expanded=False):
         with st.form("add_deal"):
             c1, c2 = st.columns(2)
             borrower_labels = {f"{row['name']} (ID {int(row['id'])})": int(row["id"])
                                for _, row in borrowers.iterrows()}
             borrower_label = c1.selectbox("Borrower", list(borrower_labels.keys()))
             deal_name = c2.text_input("Deal name *")
-            initial_facility_name = st.text_input("Initial facility name", value="Facility 1")
             c3, c4 = st.columns(2)
-            facility = c3.number_input("Facility amount", min_value=0.0, value=5_000_000.0, step=100_000.0)
+            facility = c3.number_input("Senior Tranche 1 amount", min_value=0.0,
+                value=5_000_000.0, step=100_000.0)
             status = c4.selectbox("Status", ["Pipeline", "Active", "Settled", "Closed", "Default"])
             c5, c6 = st.columns(2)
             settlement = c5.date_input("Settlement date", value=date.today())
             maturity = c6.date_input("Maturity date", value=add_months(date.today(), 12))
-            c7, c8, c9 = st.columns(3)
+            c7, c8 = st.columns(2)
             facility_type = c7.selectbox("Facility purpose / type", FACILITY_TYPES)
-            loan_ranking = c8.selectbox("Loan ranking", ["Senior", "Mezzanine"],
-                help="Ranking controls the default investor split; construction controls the drawdown curve, while bridge/residual stock/residential typically draw at settlement.")
-            security_type = c9.selectbox("Security type", SECURITY_TYPES)
+            security_type = c8.selectbox("Security type", SECURITY_TYPES)
             property_value = st.number_input("Property / security value", min_value=0.0,
                                              value=8_000_000.0, step=100_000.0)
-            if st.form_submit_button("Create deal", type="primary"):
+            st.info("Tranche 1 is created as Senior. Later tranches can each be tagged Senior or Mezzanine.")
+            if st.form_submit_button("Create deal with Senior Tranche 1", type="primary"):
                 if not deal_name.strip():
                     st.error("Deal name is required.")
                 elif maturity <= settlement:
@@ -2102,10 +2165,10 @@ def page_deals():
                     borrower_id = borrower_labels[borrower_label]
                     save_deal(borrower_id, deal_name.strip(), facility, status, settlement, maturity,
                               facility_type, security_type, property_value,
-                              {"loan_ranking": loan_ranking, "interest_treatment": "Serviced",
-                               "interest_advance_months": 1, "investor_target_irr": 8.0},
-                              initial_facility_name.strip() or "Facility 1")
-                    st.success(f"Created deal: {deal_name.strip()}")
+                              {"loan_ranking": "Senior", "interest_treatment": "Serviced",
+                               "interest_advance_months": 1, "default_investor_target_irr": 8.0},
+                              "Tranche 1")
+                    st.success(f"Created deal: {deal_name.strip()} with Senior Tranche 1.")
                     st.rerun()
 
     deals = load_deals()
@@ -2113,45 +2176,59 @@ def page_deals():
     if not roots.empty:
         root_labels = {f"{row['deal_name']} · {row['borrower_name']} · Deal ID {int(row['id'])}": int(row["id"])
                        for _, row in roots.iterrows()}
-        with st.expander("＋ Add a facility to an existing deal", expanded=False):
-            with st.form("add_facility_to_deal"):
-                root_label = st.selectbox("Deal", list(root_labels.keys()))
-                root_id = root_labels[root_label]
-                root_row = roots[roots["id"] == root_id].iloc[0]
+        with st.expander("＋ Add next tranche", expanded=False):
+            root_label = st.selectbox("Deal", list(root_labels.keys()), key="add_tranche_parent")
+            root_id = root_labels[root_label]
+            root_row = roots[roots["id"] == root_id].iloc[0]
+            next_number = next_tranche_number(deals, root_id)
+            tranche_name = f"Tranche {next_number}"
+            st.info(f"Next in sequence: {tranche_name}. Each tranche keeps its own terms, ranking, investor returns and allocations.")
+            with st.form(f"add_tranche_form_{root_id}"):
                 f1, f2, f3 = st.columns(3)
-                new_facility_name = f1.text_input("Facility name *", value="Facility 2")
-                new_facility_amount = f2.number_input("Facility amount", min_value=0.0,
-                    value=1_000_000.0, step=100_000.0)
-                new_status = f3.selectbox("Status", ["Pipeline", "Active", "Settled", "Closed", "Default"],
-                    index=["Pipeline", "Active", "Settled", "Closed", "Default"].index(str(root_row["deal_status"])))
+                tranche_widget_suffix = f"{root_id}_{next_number}"
+                f1.text_input("Tranche name", value=tranche_name, disabled=True,
+                    key=f"tranche_name_{tranche_widget_suffix}")
+                new_facility_amount = f2.number_input("Tranche amount", min_value=0.0,
+                    value=1_000_000.0, step=100_000.0,
+                    key=f"tranche_amount_{tranche_widget_suffix}")
+                status_options = ["Pipeline", "Active", "Settled", "Closed", "Default"]
+                root_status = str(root_row["deal_status"])
+                new_status = f3.selectbox("Status", status_options,
+                    index=status_options.index(root_status) if root_status in status_options else 0,
+                    key=f"tranche_status_{tranche_widget_suffix}")
                 f4, f5, f6 = st.columns(3)
-                new_settlement = f4.date_input("Settlement date", value=parse_date(root_row["settlement_date"], date.today()))
-                new_maturity = f5.date_input("Maturity date", value=parse_date(root_row["maturity_date"], add_months(date.today(), 12)))
-                new_facility_type = f6.selectbox("Facility type", FACILITY_TYPES,
-                    index=FACILITY_TYPES.index(root_row["facility_type"]) if root_row["facility_type"] in FACILITY_TYPES else 0)
+                new_settlement = f4.date_input("Settlement date", value=parse_date(root_row["settlement_date"], date.today()),
+                    key=f"tranche_settlement_{tranche_widget_suffix}")
+                new_maturity = f5.date_input("Maturity date", value=parse_date(root_row["maturity_date"], add_months(date.today(), 12)),
+                    key=f"tranche_maturity_{tranche_widget_suffix}")
+                root_facility_type = str(root_row["facility_type"])
+                new_facility_type = f6.selectbox("Facility purpose / type", FACILITY_TYPES,
+                    index=FACILITY_TYPES.index(root_facility_type) if root_facility_type in FACILITY_TYPES else 0,
+                    key=f"tranche_type_{tranche_widget_suffix}")
                 f7, f8 = st.columns(2)
-                new_ranking = f7.selectbox("Loan ranking", ["Senior", "Mezzanine"],
-                    index=1 if root_row["loan_ranking"] == "Mezzanine" else 0)
+                new_ranking = f7.selectbox("Tranche ranking", ["Senior", "Mezzanine"], index=0,
+                    key=f"tranche_ranking_{tranche_widget_suffix}")
+                root_security = str(root_row["security_type"])
                 new_security = f8.selectbox("Security type", SECURITY_TYPES,
-                    index=SECURITY_TYPES.index(root_row["security_type"]) if root_row["security_type"] in SECURITY_TYPES else 0)
+                    index=SECURITY_TYPES.index(root_security) if root_security in SECURITY_TYPES else 0,
+                    key=f"tranche_security_{tranche_widget_suffix}")
                 new_property_value = st.number_input("Property / security value", min_value=0.0,
-                    value=float(root_row["property_value"] or 0), step=100_000.0)
-                if st.form_submit_button("Add facility", type="primary"):
+                    value=float(root_row["property_value"] or 0), step=100_000.0,
+                    key=f"tranche_property_{tranche_widget_suffix}")
+                if st.form_submit_button(f"Add {tranche_name}", type="primary"):
                     duplicate = ((deals["parent_deal_id"] == root_id) &
-                                 (deals["facility_name"].str.lower() == new_facility_name.strip().lower())).any()
-                    if not new_facility_name.strip():
-                        st.error("Facility name is required.")
-                    elif duplicate:
-                        st.error("That facility name already exists under this deal.")
+                        (deals["facility_name"].fillna("").astype(str).str.lower() == tranche_name.lower())).any()
+                    if duplicate:
+                        st.error(f"{tranche_name} already exists. Refresh and add the next tranche in sequence.")
                     elif new_maturity <= new_settlement:
-                        st.error("Facility maturity must be after its settlement date.")
+                        st.error("Tranche maturity must be after its settlement date.")
                     else:
-                        new_id = save_additional_facility(root_id, new_facility_name.strip(),
+                        new_id = save_additional_facility(root_id, tranche_name,
                             new_facility_amount, new_status, new_settlement, new_maturity,
                             new_facility_type, new_security, new_property_value,
                             {"loan_ranking": new_ranking, "interest_treatment": "Serviced",
-                             "interest_advance_months": 1, "investor_target_irr": 8.0})
-                        st.success(f"Added facility {new_facility_name.strip()} (ID {new_id}).")
+                             "interest_advance_months": 1, "default_investor_target_irr": 8.0})
+                        st.success(f"Added {tranche_name} with {new_ranking} ranking (ID {new_id}).")
                         st.rerun()
 
     if deals.empty:
@@ -2163,8 +2240,8 @@ def page_deals():
     show_cols = ["id", "borrower_name", "deal_name", "facility_name", "facility_type", "loan_ranking", "facility_amount", "deal_status",
                  "settlement_date", "maturity_date", "security_type", "property_value"]
     display = filtered[[column for column in show_cols if column in filtered.columns]].rename(columns={
-        "id": "Facility ID", "borrower_name": "Borrower", "deal_name": "Deal", "facility_name": "Facility", "facility_type": "Facility Type",
-        "loan_ranking": "Ranking", "facility_amount": "Facility Amount", "deal_status": "Status", "settlement_date": "Settlement",
+        "id": "Tranche ID", "borrower_name": "Borrower", "deal_name": "Deal", "facility_name": "Tranche", "facility_type": "Facility Type",
+        "loan_ranking": "Ranking", "facility_amount": "Tranche Amount", "deal_status": "Status", "settlement_date": "Settlement",
         "maturity_date": "Maturity", "security_type": "Security", "property_value": "Security Value"})
     st.dataframe(display, use_container_width=True, hide_index=True)
 
@@ -2179,24 +2256,17 @@ def page_modeler():
         st.warning("Create a deal first in Deals.")
         return
 
-    deal_labels = {f"{row['deal_name']} · {row['facility_name']} · {row['borrower_name']} · Facility ID {int(row['id'])}": int(row["id"])
+    deal_labels = {f"{row['deal_name']} · {row['facility_name']} · {row['borrower_name']} · Tranche ID {int(row['id'])}": int(row["id"])
                    for _, row in deals.iterrows()}
-    selected_label = st.selectbox("Select deal / facility", list(deal_labels.keys()), key="workspace_deal_select")
+    selected_label = st.selectbox("Select deal / tranche", list(deal_labels.keys()), key="workspace_deal_select")
     deal_id = deal_labels[selected_label]
     deal_row = deals[deals["id"] == deal_id].iloc[0]
     existing_params = safe_json(deal_row.get("params_json", "{}"), {})
     ensure_default_deal_investors(deal_id)
     deal_investors_df = load_deal_investors(deal_id)
-    legacy_target_values = (pd.to_numeric(deal_investors_df.get("target_irr", pd.Series(dtype=float)),
-        errors="coerce").dropna() if not deal_investors_df.empty else pd.Series(dtype=float))
-    legacy_shared_target = float(legacy_target_values.mean()) if not legacy_target_values.empty else 8.0
-    try:
-        investor_target_default = float(existing_params.get("investor_target_irr", legacy_shared_target))
-        if not np.isfinite(investor_target_default):
-            investor_target_default = legacy_shared_target
-    except (TypeError, ValueError):
-        investor_target_default = legacy_shared_target
-    investor_target_default = max(0.0, min(50.0, investor_target_default))
+    stored_return_overrides = safe_json(existing_params.get("investor_return_overrides", {}), {})
+    if not isinstance(stored_return_overrides, dict):
+        stored_return_overrides = {}
     investor_transactions_df = load_investor_transactions(deal_id)
     actual_capital_calls = capital_calls_by_date(investor_transactions_df)
 
@@ -2216,7 +2286,7 @@ def page_modeler():
         loan_ranking_default = "Senior"
 
     st.markdown(f"### {deal_row['deal_name']}  ·  {deal_row['facility_name']}  ·  {deal_row['borrower_name']}")
-    st.caption(f"Facility ID {deal_id}  |  Status: {deal_row['deal_status']}  |  Security: {deal_row['security_type']}")
+    st.caption(f"Tranche ID {deal_id}  |  Ranking: {loan_ranking_default}  |  Status: {deal_row['deal_status']}  |  Security: {deal_row['security_type']}")
     st.markdown('<div class="section-note">Edit assumptions or drawdowns once. All schedules, investor allocations, economics and cashflows below recalculate from the current inputs. Save changes from the Overview tab to persist them.</div>',
                 unsafe_allow_html=True)
 
@@ -2227,9 +2297,9 @@ def page_modeler():
     # ── Setup & terms ──────────────────────────────────────────
     prefix = f"deal_{deal_id}_"
     with tabs[1]:
-        setup_tabs = st.tabs(["Facility & Dates", "Returns & Allocation", "Fees & Covenants"])
+        setup_tabs = st.tabs(["Tranche & Dates", "Returns & Allocation", "Fees & Covenants"])
         with setup_tabs[0]:
-            st.subheader("Facility and timeline")
+            st.subheader("Tranche terms and timeline")
             c1, c2, c3 = st.columns(3)
             init_widget_state(prefix + "facility_type", facility_type_default)
             facility_type = c1.selectbox("Facility type", FACILITY_TYPES, key=prefix + "facility_type")
@@ -2329,17 +2399,102 @@ def page_modeler():
                 st.info("Senior default: BPCFMC 50% · BPCFLC 15% · CBCF 35%. Optional investors are 0% until you allocate them on a row.")
             else:
                 st.info("Mezzanine default: BPCFMC 80% · BPCFLC 20%. CBCF is not included by default; optional investors can be attached and allocated when needed.")
-            init_widget_state(prefix + "investor_target_irr", investor_target_default)
-            investor_target_irr = st.number_input("Shared investor target return (% p.a.)",
-                min_value=0.0, max_value=50.0, step=0.25,
-                key=prefix + "investor_target_irr",
-                help="One return assumption applies to every investor attached to this facility/tranche. Set a different rate on another facility if needed.")
-            st.caption("This is a facility-level assumption shared by all investors attached to this tranche; it is not an individual investor rate.")
+            st.caption("Each investor has separate Senior and Mezzanine target-return defaults. Set global defaults in Investor Portal; override either rate for this tranche in the table.")
+            return_rows = []
+            for _, investor_row in deal_investors_df.iterrows():
+                investor_id = int(investor_row["id"])
+                stored = stored_return_overrides.get(str(investor_id), stored_return_overrides.get(investor_id, {}))
+                stored = stored if isinstance(stored, dict) else {}
+                try:
+                    senior_default = float(investor_row.get("senior_target_irr", 8.0))
+                    if not np.isfinite(senior_default):
+                        senior_default = 8.0
+                except (TypeError, ValueError):
+                    senior_default = 8.0
+                try:
+                    mezz_default = float(investor_row.get("mezz_target_irr", 8.0))
+                    if not np.isfinite(mezz_default):
+                        mezz_default = 8.0
+                except (TypeError, ValueError):
+                    mezz_default = 8.0
+                senior_default = max(0.0, min(50.0, senior_default))
+                mezz_default = max(0.0, min(50.0, mezz_default))
+                if stored:
+                    senior_rate = stored.get("senior", senior_default)
+                    mezz_rate = stored.get("mezzanine", stored.get("mezz", mezz_default))
+                else:
+                    senior_rate, mezz_rate = senior_default, mezz_default
+                try:
+                    senior_rate = float(senior_rate)
+                    if not np.isfinite(senior_rate):
+                        raise ValueError("non-finite Senior return")
+                    senior_rate = max(0.0, min(50.0, senior_rate))
+                except (TypeError, ValueError):
+                    senior_rate = senior_default
+                try:
+                    mezz_rate = float(mezz_rate)
+                    if not np.isfinite(mezz_rate):
+                        raise ValueError("non-finite Mezzanine return")
+                    mezz_rate = max(0.0, min(50.0, mezz_rate))
+                except (TypeError, ValueError):
+                    mezz_rate = mezz_default
+                applied_rate = senior_rate if loan_ranking == "Senior" else mezz_rate
+                return_rows.append({
+                    "Investor ID": investor_id, "Investor": str(investor_row["name"]),
+                    "Type": str(investor_row["investor_type"]),
+                    "Senior allocation default (%)": float(investor_row.get("senior_default_pct", 0.0) or 0.0),
+                    "Mezzanine allocation default (%)": float(investor_row.get("mezz_default_pct", 0.0) or 0.0),
+                    "Senior return (% p.a.)": senior_rate,
+                    "Mezzanine return (% p.a.)": mezz_rate,
+                    "Applied return (% p.a.)": applied_rate,
+                })
+            return_columns = ["Investor ID", "Investor", "Type", "Senior allocation default (%)",
+                "Mezzanine allocation default (%)", "Senior return (% p.a.)",
+                "Mezzanine return (% p.a.)", "Applied return (% p.a.)"]
+            return_matrix = pd.DataFrame(return_rows, columns=return_columns)
+            return_fingerprint = hashlib.sha1(str(sorted(return_matrix["Investor ID"].astype(int).tolist())).encode()).hexdigest()[:8]
+            return_editor_key = prefix + "investor_returns_matrix_" + return_fingerprint
+            edited_returns = st.data_editor(return_matrix, key=return_editor_key, hide_index=True,
+                use_container_width=True, num_rows="fixed", column_config={
+                    "Investor ID": st.column_config.NumberColumn("Investor ID", disabled=True),
+                    "Investor": st.column_config.TextColumn("Investor", disabled=True),
+                    "Type": st.column_config.TextColumn("Type", disabled=True),
+                    "Senior allocation default (%)": st.column_config.NumberColumn("Senior allocation default (%)", disabled=True),
+                    "Mezzanine allocation default (%)": st.column_config.NumberColumn("Mezzanine allocation default (%)", disabled=True),
+                    "Senior return (% p.a.)": st.column_config.NumberColumn("Senior return (% p.a.)",
+                        min_value=0.0, max_value=50.0, step=0.25, format="%.2f", required=True),
+                    "Mezzanine return (% p.a.)": st.column_config.NumberColumn("Mezzanine return (% p.a.)",
+                        min_value=0.0, max_value=50.0, step=0.25, format="%.2f", required=True),
+                    "Applied return (% p.a.)": st.column_config.NumberColumn("Applied return (% p.a.)", disabled=True),
+                })
+            investor_return_overrides = {}
+            investor_return_rates = {}
+            return_defaults_by_id = {int(row["Investor ID"]): row for _, row in return_matrix.iterrows()}
+            for _, return_row in edited_returns.iterrows():
+                investor_id = int(return_row["Investor ID"])
+                defaults = return_defaults_by_id.get(investor_id, {})
+                try:
+                    senior_rate = float(return_row["Senior return (% p.a.)"])
+                    if not np.isfinite(senior_rate):
+                        raise ValueError("non-finite Senior return")
+                except (TypeError, ValueError):
+                    senior_rate = float(defaults.get("Senior return (% p.a.)", 8.0))
+                try:
+                    mezz_rate = float(return_row["Mezzanine return (% p.a.)"])
+                    if not np.isfinite(mezz_rate):
+                        raise ValueError("non-finite Mezzanine return")
+                except (TypeError, ValueError):
+                    mezz_rate = float(defaults.get("Mezzanine return (% p.a.)", 8.0))
+                senior_rate = max(0.0, min(50.0, senior_rate))
+                mezz_rate = max(0.0, min(50.0, mezz_rate))
+                selected_rate = senior_rate if loan_ranking == "Senior" else mezz_rate
+                investor_return_overrides[str(investor_id)] = {
+                    "senior": senior_rate, "mezzanine": mezz_rate}
+                investor_return_rates[str(return_row["Investor"])] = selected_rate
             if not deal_investors_df.empty:
-                inv_view = deal_investors_df[["name", "investor_type", "senior_default_pct", "mezz_default_pct"]].rename(columns={
-                    "name": "Investor", "investor_type": "Type",
-                    "senior_default_pct": "Senior default (%)", "mezz_default_pct": "Mezzanine default (%)"})
-                st.dataframe(inv_view, use_container_width=True, hide_index=True)
+                deal_investors_df = deal_investors_df.copy()
+                deal_investors_df["target_irr"] = deal_investors_df["name"].map(investor_return_rates).fillna(8.0)
+            st.caption("The selected Loan ranking determines which investor-specific return is applied. Allocation defaults remain separate from return rates.")
             st.caption("Attach or remove optional investors (for example, CBFM or Syndicate) in the Investor Portal. Their allocation columns will then appear in the drawdown plan.")
 
         with setup_tabs[2]:
@@ -2390,7 +2545,9 @@ def page_modeler():
         "maturity_date": maturity_date.isoformat(), "term_months": int(term_months),
         "interest_treatment": interest_treatment,
         "interest_advance_months": interest_advance_setting,
-        "investor_target_irr": float(investor_target_irr),
+        "default_investor_target_irr": 8.0,
+        "investor_return_overrides": investor_return_overrides,
+        "investor_return_rates": investor_return_rates,
         "construction_months": int(construction_months), "borrower_irr": float(borrower_irr),
         "cpr": float(cpr), "drawdown_profile": drawdown_profile,
         "s_curve_steepness": float(s_curve_steepness), "loan_ranking": loan_ranking,
@@ -2521,7 +2678,7 @@ def page_modeler():
         st.subheader("Live deal overview")
         st.caption("All figures below use the current on-screen assumptions and drawdown plan. Click Save all changes to persist them to the deal record.")
         k1, k2, k3, k4, k5, k6 = st.columns(6)
-        k1.metric("Facility", money(facility_amount))
+        k1.metric("Tranche Amount", money(facility_amount))
         k2.metric("Gross drawn", money(schedule_df["Drawdown_Gross"].sum()))
         k3.metric("Outstanding at maturity", money(schedule_df["Ending_Balance"].iloc[-1]))
         k4.metric("Projected borrower XIRR", percent(borrower_xirr * 100.0))
@@ -2703,8 +2860,8 @@ def page_modeler():
     # ── Investor ledger ─────────────────────────────────────────
     with tabs[5]:
         st.subheader("Investor base and returns")
-        st.caption(f"Shared investor target return for this facility/tranche: {investor_target_irr:.2f}% p.a.")
-        st.info("Standard rows use the deal ranking: Senior 50% / 15% / 35% (BPCFMC / BPCFLC / CBCF), or Mezzanine 80% / 20% (BPCFMC / BPCFLC). Investor Ledger and Manual rows use their recorded/entered splits. Buyouts and actual repayments are applied from Investor Portal transactions.")
+        st.caption(f"Investor target returns are individual; the {loan_ranking} return is applied for this tranche. See Setup & Terms → Returns & Allocation for each investor’s rate and the alternate-ranking default.")
+        st.info("Standard rows use the tranche ranking: Senior 50% / 15% / 35% (BPCFMC / BPCFLC / CBCF), or Mezzanine 80% / 20% (BPCFMC / BPCFLC). Investor Ledger and Manual rows use their recorded/entered splits. Buyouts and actual repayments are applied from Investor Portal transactions.")
         summary_format = {"Total_Funded": "${:,.0f}", "Total_Interest_Earned": "${:,.0f}",
             "Total_Principal_Returned": "${:,.0f}", "Outstanding_Balance": "${:,.0f}",
             "Target_XIRR": "{:.2f}%", "Actual_XIRR": "{:.2f}%"}
@@ -2868,7 +3025,7 @@ def page_modeler():
 
 def page_borrower_servicing():
     st.title("Borrower Servicing")
-    st.caption("Record one borrower receipt at deal level, review the senior-first facility waterfall, and override facility allocations when needed.")
+    st.caption("Record one borrower receipt at deal level, review the senior-first tranche waterfall, and override tranche allocations when needed.")
     deals = load_deals()
     roots = deals[deals["parent_deal_id"] == deals["id"]] if not deals.empty else deals
     if roots.empty:
@@ -2881,7 +3038,7 @@ def page_borrower_servicing():
     parent_id = root_labels[root_label]
     root_row = roots[roots["id"] == parent_id].iloc[0]
     facilities = deals[deals["parent_deal_id"] == parent_id].copy()
-    st.caption("Routine receipt interest is calculated through each facility’s last settlement anniversary. For a payoff, enter an interest-through date; the selected minimum prepaid period remains due, with excess advance interest credited.")
+    st.caption("Routine receipt interest is calculated through each tranche’s last settlement anniversary. For a payoff, enter an interest-through date; the selected minimum prepaid period remains due, with excess advance interest credited.")
 
     c1, c2, c3 = st.columns(3)
     receipt_date = c1.date_input("Receipt / value date", value=date.today(), key=f"receipt_date_{parent_id}")
@@ -2901,17 +3058,17 @@ def page_borrower_servicing():
         allocated_total = 0.0
     else:
         display = proposed.rename(columns={
-            "facility_deal_id": "Facility ID", "Facility": "Facility", "Ranking": "Ranking",
+            "facility_deal_id": "Tranche ID", "Facility": "Tranche", "Ranking": "Ranking",
             "period_date": "Service period", "fees": "Fees", "penalty_interest": "Arrears interest",
             "interest": "Interest", "principal": "Principal"})
         editor_key = f"receipt_allocations_{parent_id}_{receipt_date.isoformat()}_{int(round(receipt_amount))}_{int(is_payoff)}"
-        edited_display = st.data_editor(display[["Facility ID", "Facility", "Ranking", "Service period",
+        edited_display = st.data_editor(display[["Tranche ID", "Tranche", "Ranking", "Service period",
             "fees_available", "penalty_available", "interest_available", "principal_available",
             "Fees", "Arrears interest", "Interest", "Principal"]],
             key=editor_key, hide_index=True, use_container_width=True, num_rows="fixed",
             column_config={
-                "Facility ID": st.column_config.NumberColumn("Facility ID", disabled=True),
-                "Facility": st.column_config.TextColumn("Facility", disabled=True),
+                "Tranche ID": st.column_config.NumberColumn("Tranche ID", disabled=True),
+                "Tranche": st.column_config.TextColumn("Tranche", disabled=True),
                 "Ranking": st.column_config.TextColumn("Rank", disabled=True),
                 "Service period": st.column_config.DateColumn("Service period", disabled=True, format="DD MMM YYYY"),
                 "fees_available": st.column_config.NumberColumn("Fees available", disabled=True, format="$%.0f"),
@@ -2938,7 +3095,7 @@ def page_borrower_servicing():
         unapplied_amount = max(0.0, receipt_amount - allocated_total)
         st.metric("Allocated across facilities", money(allocated_total),
                   delta=f"Unapplied / refund {money(unapplied_amount)}")
-    if st.button("Save borrower receipt and facility split", type="primary", key=f"save_borrower_receipt_{parent_id}"):
+    if st.button("Save borrower receipt and tranche split", type="primary", key=f"save_borrower_receipt_{parent_id}"):
         if receipt_amount <= 0:
             st.error("Enter a receipt amount greater than zero.")
         elif edited_allocations.empty:
@@ -3032,16 +3189,22 @@ def page_investor_portal():
         st.subheader("Investor register")
         with st.expander("＋ Add investor", expanded=False):
             with st.form("add_investor_form"):
-                c1, c2 = st.columns(2)
+                c1, c2, c3, c4 = st.columns(4)
                 investor_name = c1.text_input("Investor name *")
                 investor_type = c2.selectbox("Investor type", ["Fund", "CBFM", "Syndicate", "Institutional", "Individual", "Other"])
+                senior_default_return = c3.number_input("Senior default return (% p.a.)",
+                    min_value=0.0, max_value=50.0, value=8.0, step=0.25)
+                mezz_default_return = c4.number_input("Mezzanine default return (% p.a.)",
+                    min_value=0.0, max_value=50.0, value=8.0, step=0.25)
                 investor_notes = st.text_input("Notes")
                 if st.form_submit_button("Save investor", type="primary"):
                     if not investor_name.strip():
                         st.error("Investor name is required.")
                     else:
                         try:
-                            save_investor(investor_name, investor_type, 8.0, investor_notes)
+                            save_investor(investor_name, investor_type, 8.0, investor_notes,
+                                senior_target_irr=senior_default_return,
+                                mezz_target_irr=mezz_default_return)
                             st.success(f"Added {investor_name.strip()}.")
                             st.rerun()
                         except sqlite3.IntegrityError:
@@ -3050,8 +3213,11 @@ def page_investor_portal():
         if investors.empty:
             st.info("No investors found.")
         else:
-            st.dataframe(investors[["id", "name", "investor_type", "status", "notes"]].rename(columns={
+            st.dataframe(investors[["id", "name", "investor_type", "senior_target_irr",
+                "mezz_target_irr", "status", "notes"]].rename(columns={
                 "id": "ID", "name": "Investor", "investor_type": "Type",
+                "senior_target_irr": "Senior default return (% p.a.)",
+                "mezz_target_irr": "Mezzanine default return (% p.a.)",
                 "status": "Status", "notes": "Notes"}), use_container_width=True, hide_index=True)
             manage_id = st.selectbox("Manage investor", investors["id"].astype(int).tolist(),
                 format_func=lambda value: f"{investors.loc[investors.id == int(value), 'name'].iloc[0]} · ID {int(value)}",
@@ -3062,12 +3228,22 @@ def page_investor_portal():
             if str(manage_row["investor_type"]) not in type_options:
                 type_options.append(str(manage_row["investor_type"]))
             with st.form(f"edit_investor_form_{int(manage_id)}"):
-                ec1, ec2 = st.columns(2)
+                ec1, ec2, ec3, ec4 = st.columns(4)
                 edited_name = ec1.text_input("Investor name", value=str(manage_row["name"]),
                     disabled=is_core, key=f"edit_investor_name_{int(manage_id)}")
                 edited_type = ec2.selectbox("Investor type", type_options,
                     index=type_options.index(str(manage_row["investor_type"])),
                     key=f"edit_investor_type_{int(manage_id)}")
+                edited_senior_return = ec3.number_input("Senior default return (% p.a.)",
+                    min_value=0.0, max_value=50.0,
+                    value=max(0.0, min(50.0, float(manage_row.get("senior_target_irr")
+                        if pd.notna(manage_row.get("senior_target_irr")) else 8.0))),
+                    step=0.25, key=f"edit_investor_senior_return_{int(manage_id)}")
+                edited_mezz_return = ec4.number_input("Mezzanine default return (% p.a.)",
+                    min_value=0.0, max_value=50.0,
+                    value=max(0.0, min(50.0, float(manage_row.get("mezz_target_irr")
+                        if pd.notna(manage_row.get("mezz_target_irr")) else 8.0))),
+                    step=0.25, key=f"edit_investor_mezz_return_{int(manage_id)}")
                 status_options = ["Active", "Inactive"]
                 current_status = str(manage_row["status"] or "Active")
                 if current_status not in status_options:
@@ -3084,13 +3260,15 @@ def page_investor_portal():
                         try:
                             update_investor(manage_id, edited_name, edited_type,
                                             float(manage_row["target_irr"] or 8.0),
-                                            edited_status, edited_notes)
+                                            edited_status, edited_notes,
+                                            senior_target_irr=edited_senior_return,
+                                            mezz_target_irr=edited_mezz_return)
                             st.success("Investor details updated.")
                             st.rerun()
                         except sqlite3.IntegrityError:
                             st.error("An investor with that name already exists.")
             if is_core:
-                st.caption("Core pool names and active status are fixed to preserve standard allocation rules.")
+                st.caption("Core pool names and active status are fixed; Senior and Mezzanine return defaults remain editable.")
 
     deals = load_deals()
     active_investors = load_investors(active_only=True)
@@ -3103,43 +3281,46 @@ def page_investor_portal():
             st.info("No deal activity to show yet.")
         return
 
-    deal_labels = {f"{row['deal_name']} · {row['facility_name']} · {row['borrower_name']} · Facility ID {int(row['id'])}": int(row["id"])
+    deal_labels = {f"{row['deal_name']} · {row['facility_name']} · {row['borrower_name']} · Tranche ID {int(row['id'])}": int(row["id"])
                    for _, row in deals.iterrows()}
     label_by_deal = {value: key for key, value in deal_labels.items()}
     investor_labels = {int(row["id"]): str(row["name"]) for _, row in active_investors.iterrows()}
 
     # Attach optional investor entities to a deal
     with investor_tabs[1]:
-        st.subheader("Deal investor assignments")
-        assignment_label = st.selectbox("Select deal", list(deal_labels.keys()), key="investor_assign_deal")
+        st.subheader("Tranche investor assignments")
+        assignment_label = st.selectbox("Select tranche", list(deal_labels.keys()), key="investor_assign_deal")
         assignment_deal_id = deal_labels[assignment_label]
         current_assignment = load_deal_investors(assignment_deal_id)
         current_ids = [int(value) for value in current_assignment["id"].tolist()]
         assignment_key = f"investor_assignment_{assignment_deal_id}"
         if assignment_key not in st.session_state:
             st.session_state[assignment_key] = current_ids
-        selected_ids = st.multiselect("Investors attached to this facility", list(investor_labels.keys()),
+        selected_ids = st.multiselect("Investors attached to this tranche", list(investor_labels.keys()),
             key=assignment_key, format_func=lambda value: investor_labels.get(int(value), str(value)))
-        st.caption("Investor returns are set once per facility/tranche in Deal Workspace and shared by all investors attached to it.")
         assignment_deal = deals[deals["id"] == assignment_deal_id].iloc[0]
         assignment_params = safe_json(assignment_deal.get("params_json", "{}"), {})
-        if "investor_target_irr" in assignment_params:
-            st.info(f"Shared facility target return: {float(assignment_params['investor_target_irr']):.2f}% p.a. · edit in Deal Workspace → Returns & Allocation.")
-        if st.button("Save facility investor assignments", type="primary",
+        assignment_ranking = str(assignment_params.get("loan_ranking", "Senior"))
+        st.caption(f"Investor returns are set individually for Senior and Mezzanine on each tranche. The {assignment_ranking} rate applies here; edit the per-investor rates in Deal Workspace → Returns & Allocation.")
+        if st.button("Save tranche investor assignments", type="primary",
                      key=f"save_assignments_{assignment_deal_id}"):
             save_deal_investors(assignment_deal_id, selected_ids)
-            st.success("Facility investor assignments were saved.")
+            st.success("Tranche investor assignments were saved.")
             st.rerun()
         if not current_assignment.empty:
-            assignment_view = current_assignment[["name", "investor_type", "senior_default_pct", "mezz_default_pct"]].rename(columns={
+            assignment_view = current_assignment[["name", "investor_type", "senior_default_pct", "mezz_default_pct",
+                "senior_target_irr", "mezz_target_irr"]].rename(columns={
                 "name": "Investor", "investor_type": "Type",
-                "senior_default_pct": "Senior default (%)", "mezz_default_pct": "Mezzanine default (%)"})
+                "senior_default_pct": "Senior allocation default (%)",
+                "mezz_default_pct": "Mezzanine allocation default (%)",
+                "senior_target_irr": "Senior return default (% p.a.)",
+                "mezz_target_irr": "Mezzanine return default (% p.a.)"})
             st.dataframe(assignment_view, use_container_width=True, hide_index=True)
 
     # Record actual movements; buyouts are entered as a single total with a user-defined seller split.
     with investor_tabs[2]:
         st.subheader("Record an investor movement")
-        movement_label = st.selectbox("Deal", list(deal_labels.keys()), key="movement_deal")
+        movement_label = st.selectbox("Deal / tranche", list(deal_labels.keys()), key="movement_deal")
         movement_deal_id = deal_labels[movement_label]
         attached = load_deal_investors(movement_deal_id)
         if attached.empty:
@@ -3258,7 +3439,7 @@ def page_investor_portal():
             activity = pd.DataFrame({
                 "Date": transactions["transaction_date"],
                 "Deal": transactions["deal_name"],
-                "Facility": transactions["facility_name"],
+                "Tranche": transactions["facility_name"],
                 "Movement": transactions["transaction_type"],
                 "From": transactions.apply(transaction_from, axis=1),
                 "To": transactions.apply(transaction_to, axis=1),
