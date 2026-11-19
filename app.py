@@ -391,7 +391,7 @@ def init_db():
             "loan_ranking": "Senior", "borrower_irr": 12.0, "cpr": 0.0,
             "principal_repayment_mode": "Bullet at maturity",
             "principal_repayment_schedule": [],
-            "interest_treatment": "Capitalised", "interest_advance_months": 1,
+            "interest_treatment": "Serviced", "interest_advance_months": 1,
             "construction_months": 0, "interest_only_months": 0,
             "drawdown_profile": "Automatic", "s_curve_steepness": 5.0,
             "estab_fee_pct": 2.0, "line_fee_pct": 0.5,
@@ -401,7 +401,7 @@ def init_db():
             "pv_growth_annual": 3.0, "covenant_lvr": 75.0,
             "default_investor_target_irr": 8.0,
             "drawdown_schedule": json.dumps({demo_settlement.isoformat(): {
-                "gross_draw": 9_000_000.0, "allocation_source": "Standard",
+                "gross_draw": 9_800_000.0, "allocation_source": "Standard",
                 "status": "Forecast", "allocations": {}}}),
         }
         conn.execute("""INSERT INTO deals (borrower_id, deal_name, facility_name, parent_deal_id,
@@ -897,12 +897,15 @@ def build_schedule(params, actuals_map, drawdown_map):
             interest_principal = (max(0.0, cumulative_drawn)
                 if index < advance_months else balance_after_draw)
             interest_accrued = interest_principal * annual_rate_for_days(annual_rate, days)
+        gross_interest_accrued = max(0.0, float(interest_accrued))
+        interest_cap_shortfall = 0.0
         if interest_treatment == "Capitalised" and not bool(actual.get("payment_actuals_logged", False)):
             fees_reserved_within_cap = max(projected_fee_cap_reserve,
                 cumulative_cap_fee_charges + current_cap_fee_charges)
             available_for_interest = max(0.0, facility_amount - cumulative_drawn
                 - cumulative_upfront_funded - fees_reserved_within_cap - cumulative_interest_charged)
             interest_accrued = min(interest_accrued, available_for_interest)
+            interest_cap_shortfall = max(0.0, gross_interest_accrued - interest_accrued)
         if after_payoff or interest_treatment == "Capitalised":
             interest_due = 0.0
         elif index == 0:
@@ -1025,7 +1028,10 @@ def build_schedule(params, actuals_map, drawdown_map):
             cumulative_upfront_fees_repaid += cash_upfront_fee_received
             cash_fees_received += cash_upfront_fee_received
             cash_interest_received += cash_capitalised_interest_received
-        total_due = (arrears_opening + cash_servicing_interest_due + penalty_interest + contract_principal
+        # Advances are collected on the draw date, not again on the anniversary payment date.
+        # Total_Due is the amount due on Payment_Date; Cash_Interest_Advance is shown separately.
+        interest_due_on_payment_date = max(0.0, cash_servicing_interest_due - cash_interest_advance)
+        total_due = (arrears_opening + interest_due_on_payment_date + penalty_interest + contract_principal
                      + line_fee + admin_fee + discharge_fee)
 
         ending_balance = max(0.0, balance_after_capitalisation - principal_applied)
@@ -1078,6 +1084,8 @@ def build_schedule(params, actuals_map, drawdown_map):
             "Capitalised_Interest": capitalised_interest,
             "Balance_After_Capitalisation": balance_after_capitalisation,
             "Interest_Accrued": interest_accrued,
+            "Gross_Interest_Accrued": gross_interest_accrued,
+            "Interest_Cap_Shortfall": interest_cap_shortfall,
             "Interest_Due": interest_due,
             "Penalty_Interest": penalty_interest,
             "Line_Fee": line_fee,
@@ -2729,6 +2737,8 @@ def page_modeler():
 
     st.markdown(f"### {deal_row['deal_name']}  ·  {deal_row['facility_name']}  ·  {deal_row['borrower_name']}")
     st.caption(f"Tranche ID {deal_id}  |  Ranking: {loan_ranking_default}  |  Status: {deal_row['deal_status']}  |  Security: {deal_row['security_type']}")
+    if existing_params.get("seed_key") == "demo_bridging_10m_bullet_v1":
+        st.info("Illustrative demo only—not a confirmed transaction. Dates, rates, fees and other assumptions are editable in Setup & Terms.")
     if legacy_facility_type_unknown and not legacy_mezzanine_type:
         st.warning(f"Legacy facility type ‘{facility_type_raw}’ is no longer available. This deal is being treated as Bridging; choose Construction or Residual Stock if that is more appropriate, then save.")
     st.markdown('<div class="section-note">Edit assumptions or drawdowns once. Schedules, investor allocations, economics and cashflows recalculate from the current inputs; workspace changes autosave to the persistent database.</div>',
@@ -3353,6 +3363,9 @@ def page_modeler():
     # ── Borrower schedule and covenant monitoring ───────────────
     with tabs[3]:
         st.subheader("Borrower loan schedule")
+        cap_interest_not_charged = float(schedule_df.get("Interest_Cap_Shortfall", pd.Series(dtype=float)).sum())
+        if interest_treatment == "Capitalised" and cap_interest_not_charged > 0.01:
+            st.warning(f"The facility limit binds: {money(cap_interest_not_charged)} of gross forecast interest is not charged because it would exceed the cap. The payoff and borrower yield reflect the cap, not the full stated rate.")
         breaches = schedule_df[schedule_df["Covenant_Breach"]]
         if not breaches.empty:
             breach_dates = ", ".join(value.strftime("%d %b %Y") for value in breaches["Payment_Date"])
@@ -3360,13 +3373,16 @@ def page_modeler():
         else:
             st.markdown('<div class="covenant-ok">All projected LVRs are within the selected covenant.</div>', unsafe_allow_html=True)
         if interest_treatment == "Capitalised":
-            st.caption(f"Capitalised interest accrues on ACT/365 against each period’s outstanding balance and is posted to principal every {capitalisation_interval_text}, with any final stub capitalised at maturity or payoff. It is not shown as cash interest due.")
-        elif net_advance_interest_from_proceeds:
+            st.caption(f"Capitalised interest accrues on ACT/365 against each period’s outstanding balance and is posted to principal every {capitalisation_interval_text}, with any final stub capitalised at maturity or payoff. It must fit inside the facility limit; ‘Interest Not Charged (cap)’ exposes any contractual accrual that did not fit.")
+        else:
+            st.caption("Interest in advance is collected on each Drawdown Date. ‘Due on Payment Date’ excludes that prepayment, so it is not counted twice at maturity.")
+        if net_advance_interest_from_proceeds:
             st.caption("All-term serviced interest for this Bridging / Residual Stock facility is withheld from the initial proceeds. It is shown separately from cash interest due and is not charged again on the settlement date.")
 
         display_cols = ["Drawdown_Date", "Payment_Date", "Drawdown_Gross", "Upfront_Fees_Deducted",
             "Advance_Interest_Withheld", "Investor_Funding", "Drawdown_Net", "Opening_Balance",
-            "Balance_After_Draw", "Interest_Accrued", "Capitalised_Interest", "Balance_After_Capitalisation",
+            "Balance_After_Draw", "Gross_Interest_Accrued", "Interest_Accrued", "Interest_Cap_Shortfall",
+            "Capitalised_Interest", "Balance_After_Capitalisation",
             "Interest_Due", "Cash_Interest_Advance", "Penalty_Interest", "Line_Fee", "Admin_Fee", "Discharge_Fee",
             "Scheduled_Principal", "Prepayment", "Maturity_Repayment", "Contract_Principal_Due",
             "Actual_Interest", "Actual_Principal", "Actual_Fees", "Total_Due",
@@ -3377,7 +3393,9 @@ def page_modeler():
             "Advance_Interest_Withheld": "Advance Interest Withheld",
             "Investor_Funding": "Investor Funding", "Drawdown_Net": "Net Drawdown",
             "Opening_Balance": "Opening Balance", "Balance_After_Draw": "Balance After Draw",
-            "Interest_Accrued": "Interest Accrued (period)",
+            "Gross_Interest_Accrued": "Gross Interest (before cap)",
+            "Interest_Accrued": "Interest Charged / Capitalised",
+            "Interest_Cap_Shortfall": "Interest Not Charged (cap)",
             "Capitalised_Interest": "Capitalised Interest",
             "Balance_After_Capitalisation": "Balance After Capitalisation",
             "Interest_Due": "Interest Assessed", "Cash_Interest_Advance": "Cash Interest Advance",
@@ -3386,7 +3404,7 @@ def page_modeler():
             "Prepayment": "Prepayment", "Maturity_Repayment": "Maturity Repayment",
             "Contract_Principal_Due": "Contract Principal Due",
             "Actual_Interest": "Actual Interest", "Actual_Principal": "Actual Principal",
-            "Actual_Fees": "Actual Fees", "Total_Due": "Total Due", "Arrears": "Arrears",
+            "Actual_Fees": "Actual Fees", "Total_Due": "Due on Payment Date", "Arrears": "Arrears",
             "Principal_Applied": "Principal Applied", "Ending_Balance": "Ending Balance",
             "Property_Value": "Property Value", "LVR_pct": "LVR (%)", "Covenant_Breach": "Breach"})
         money_columns = [column for column in display.columns if column not in
@@ -3429,7 +3447,9 @@ def page_modeler():
         existing_actual = actuals_map.get(selected_payment_date.isoformat(), {})
         existing_override = bool(existing_actual.get("drawdown_override", False))
         existing_payment_log = bool(existing_actual.get("payment_actuals_logged", False))
-        st.write(f"Draw period starts **{selected_row['Drawdown_Date'].strftime('%d %b %Y')}** · scheduled due **{money(selected_row['Total_Due'])}** · planned draw **{money(selected_row['Planned_Drawdown'])}**")
+        advance_note = (f" · interest advance on draw date **{money(selected_row['Cash_Interest_Advance'])}**"
+            if float(selected_row.get("Cash_Interest_Advance", 0.0) or 0.0) > 0 else "")
+        st.write(f"Draw period starts **{selected_row['Drawdown_Date'].strftime('%d %b %Y')}** · due on payment date **{money(selected_row['Total_Due'])}**{advance_note} · planned draw **{money(selected_row['Planned_Drawdown'])}**")
         if interest_treatment == "Capitalised":
             st.info(f"Capitalised interest accrues on ACT/365 and is added to principal every {capitalisation_interval_text} (and at payoff or maturity); no advance cash collection is made.")
         elif float(selected_row.get("Advance_Interest_Withheld", 0.0) or 0.0) > 0:
