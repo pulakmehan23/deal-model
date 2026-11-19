@@ -4,6 +4,7 @@ import json
 import sqlite3
 from datetime import date, datetime, timedelta
 from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -227,17 +228,22 @@ def parse_principal_repayment_rows(raw_schedule):
 # ═══════════════════════════════════════════════════════════════
 # DATABASE
 # ═══════════════════════════════════════════════════════════════
-DB = "lms_data.db"
+# Keep the database beside this source file, independent of the process working directory.
+DB = Path(__file__).resolve().with_name("lms_data.db")
 
 
 def get_conn():
-    conn = sqlite3.connect(DB, check_same_thread=False)
+    DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB), timeout=30, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
 def init_db():
     conn = get_conn()
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = FULL")
     conn.execute("""CREATE TABLE IF NOT EXISTS borrowers (
         id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, abn TEXT, group_name TEXT,
         risk_grade TEXT DEFAULT 'Investment Grade', industry TEXT DEFAULT 'Real Estate',
@@ -292,6 +298,7 @@ def init_db():
         PRIMARY KEY (receipt_id, facility_deal_id),
         FOREIGN KEY (receipt_id) REFERENCES borrower_receipts(id) ON DELETE CASCADE,
         FOREIGN KEY (facility_deal_id) REFERENCES deals(id))""")
+
 
     deal_cols = {row[1] for row in conn.execute("PRAGMA table_info(deals)").fetchall()}
     if "facility_name" not in deal_cols:
@@ -352,6 +359,74 @@ def init_db():
         conn.execute("ALTER TABLE actuals ADD COLUMN payment_actuals_logged INTEGER DEFAULT 1")
     conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_actuals_deal_date
                     ON actuals(deal_id, actual_date) WHERE actual_date IS NOT NULL""")
+
+    # Seed one inspectable Bridging example exactly once. The marker/name lookup means
+    # restarts and repeat Streamlit reruns never duplicate it or alter existing demo rows.
+    demo_borrower_name = "DEMO ONLY — Returns & Tranches Borrower"
+    demo_deal_name = "DEMO — Bridging $10m Bullet Facility"
+    demo_settlement = date(2026, 11, 13)
+    demo_maturity = date(2027, 11, 13)
+    borrower_row = conn.execute("SELECT id FROM borrowers WHERE name=? ORDER BY id LIMIT 1",
+                                (demo_borrower_name,)).fetchone()
+    if borrower_row is None:
+        conn.execute("""INSERT INTO borrowers (name, abn, group_name, risk_grade, industry, status)
+            VALUES (?, '', 'Demo Portfolio', 'Investment Grade', 'Real Estate', 'Active')""",
+            (demo_borrower_name,))
+        borrower_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    else:
+        borrower_id = int(borrower_row[0])
+    # The exact demo name is the durable idempotency key as well as the seed_key;
+    # the workspace editor intentionally writes its canonical assumptions back and
+    # may not retain metadata fields from the initial row.
+    seeded = conn.execute(
+        "SELECT 1 FROM deals WHERE borrower_id=? AND deal_name=? AND facility_name='Tranche 1' LIMIT 1",
+        (borrower_id, demo_deal_name)).fetchone() is not None
+    if not seeded:
+        demo_params = {
+            "seed_key": "demo_bridging_10m_bullet_v1",
+            "facility_amount": 10_000_000.0, "facility_type": "Bridging",
+            "property_value": 15_000_000.0,
+            "settlement_date": demo_settlement.isoformat(),
+            "maturity_date": demo_maturity.isoformat(), "term_months": 12,
+            "loan_ranking": "Senior", "borrower_irr": 12.0, "cpr": 0.0,
+            "principal_repayment_mode": "Bullet at maturity",
+            "principal_repayment_schedule": [],
+            "interest_treatment": "Serviced", "interest_advance_months": 1,
+            "construction_months": 0, "interest_only_months": 0,
+            "drawdown_profile": "Automatic", "s_curve_steepness": 5.0,
+            "estab_fee_pct": 1.5, "line_fee_pct": 0.5,
+            "admin_fee_monthly": 500.0, "discharge_fee": 1500.0,
+            "risk_review_fee": 2500.0, "legal_fee": 3500.0,
+            "other_upfront_fees": 0.0, "restructure_fee": 0.0,
+            "pv_growth_annual": 3.0, "covenant_lvr": 75.0,
+            "default_investor_target_irr": 8.0,
+            "drawdown_schedule": json.dumps({demo_settlement.isoformat(): {
+                "gross_draw": 10_000_000.0, "allocation_source": "Standard",
+                "status": "Forecast", "allocations": {}}}),
+        }
+        conn.execute("""INSERT INTO deals (borrower_id, deal_name, facility_name, parent_deal_id,
+            facility_amount, deal_status, settlement_date, maturity_date, facility_type,
+            security_type, property_value, params_json)
+            VALUES (?, ?, 'Tranche 1', NULL, ?, 'Active', ?, ?, 'Bridging',
+                    'First Mortgage', ?, ?)""",
+            (borrower_id, demo_deal_name, 10_000_000.0, demo_settlement.isoformat(),
+             demo_maturity.isoformat(), 15_000_000.0, json.dumps(demo_params)))
+        demo_deal_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.execute("UPDATE deals SET parent_deal_id=? WHERE id=?",
+                     (demo_deal_id, demo_deal_id))
+        core_defaults = {"BPCFMC": (50.0, 80.0), "BPCFLC": (15.0, 20.0), "CBCF": (35.0, 0.0)}
+        for core_name, (senior_pct, mezz_pct) in core_defaults.items():
+            investor = conn.execute("SELECT id, target_irr, senior_target_irr, mezz_target_irr FROM investors WHERE name=?",
+                                    (core_name,)).fetchone()
+            if investor:
+                conn.execute("""INSERT OR IGNORE INTO deal_investors
+                    (deal_id, investor_id, senior_default_pct, mezz_default_pct, target_irr,
+                     senior_target_irr, mezz_target_irr, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
+                    (demo_deal_id, int(investor[0]), senior_pct, mezz_pct,
+                     float(investor[1] if investor[1] is not None else 8.0),
+                     safe_rate_pct(investor[2], 8.0), safe_rate_pct(investor[3], 8.0)))
+
     conn.commit()
     conn.close()
 
@@ -2508,7 +2583,7 @@ def page_modeler():
     st.caption(f"Tranche ID {deal_id}  |  Ranking: {loan_ranking_default}  |  Status: {deal_row['deal_status']}  |  Security: {deal_row['security_type']}")
     if legacy_facility_type_unknown and not legacy_mezzanine_type:
         st.warning(f"Legacy facility type ‘{facility_type_raw}’ is no longer available. This deal is being treated as Bridging; choose Construction or Residual Stock if that is more appropriate, then save.")
-    st.markdown('<div class="section-note">Edit assumptions or drawdowns once. All schedules, investor allocations, economics and cashflows below recalculate from the current inputs. Save changes from the Overview tab to persist them.</div>',
+    st.markdown('<div class="section-note">Edit assumptions or drawdowns once. Schedules, investor allocations, economics and cashflows recalculate from the current inputs; workspace changes autosave to the persistent database.</div>',
                 unsafe_allow_html=True)
 
     tabs = st.tabs(["Overview", "Setup & Terms", "Drawdown Plan", "Loan Schedule",
@@ -2911,6 +2986,8 @@ def page_modeler():
         "restructure_fee": float(restructure_fee), "pv_growth_annual": float(pv_growth_annual),
         "covenant_lvr": float(covenant_lvr), "penalty_rate": float(penalty_rate),
     }
+    if existing_params.get("seed_key"):
+        params["seed_key"] = existing_params["seed_key"]
 
     # ── Editable drawdown and investor allocation matrix ─────────
     signature = drawdown_signature(deal_id, facility_amount, facility_type, settlement,
@@ -3014,6 +3091,16 @@ def page_modeler():
     params["drawdown_schedule"] = json.dumps(drawdown_map)
     params["drawdown_signature"] = signature
 
+    # Persist current workspace inputs on every run, but only write when values changed.
+    # This protects edits made on any tab from being lost on a session/app restart.
+    params_changed = (json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
+        != json.dumps(existing_params, sort_keys=True, separators=(",", ":"), default=str))
+    if params_changed:
+        update_deal_model(deal_id, params)
+        workspace_saved_now = True
+    else:
+        workspace_saved_now = False
+
     # Build actuals and all model outputs from the current inputs and edited grid.
     actuals_df = load_actuals(deal_id)
     receipt_allocations_df = load_receipt_allocations(facility_deal_id=deal_id)
@@ -3026,10 +3113,15 @@ def page_modeler():
     cashflow_df = build_cashflows(schedule_df, investor_ledger_df, fees,
                                   investor_cashflows, receipt_allocations_df)
 
+    if workspace_saved_now:
+        st.success(f"Workspace changes saved to {DB.name}.")
+    else:
+        st.caption(f"All workspace assumptions and drawdown edits are saved in {DB.name}.")
+
     # ── Overview ────────────────────────────────────────────────
     with tabs[0]:
         st.subheader("Live deal overview")
-        st.caption("All figures below use the current on-screen assumptions and drawdown plan. Click Save all changes to persist them to the deal record.")
+        st.caption("All figures below use the current on-screen assumptions and drawdown plan. Changes autosave; the button below can also be used to force a save.")
         k1, k2, k3, k4, k5, k6 = st.columns(6)
         k1.metric("Tranche Amount", money(facility_amount))
         k2.metric("Gross drawn", money(schedule_df["Drawdown_Gross"].sum()))
@@ -3042,11 +3134,11 @@ def page_modeler():
         d1.metric("Settlement", settlement.strftime("%d %b %Y"))
         d2.metric("Next anniversary", schedule_df["Payment_Date"].iloc[0].strftime("%d %b %Y"))
         d3.metric("Maturity anniversary", maturity_date.strftime("%d %b %Y"))
-        st.markdown("#### Save current deal setup")
-        st.caption("This saves terms, dates, fees, investor assumptions and the edited drawdown schedule to the selected deal.")
-        if st.button("Save all changes", type="primary", key=prefix + "save_all_changes"):
+        st.markdown("#### Persistence status")
+        st.caption("Terms, dates, fees, investor assumptions and the edited drawdown schedule autosave to SQLite. Use this button to force a save if needed.")
+        if st.button("Save all changes now", type="primary", key=prefix + "save_all_changes"):
             update_deal_model(deal_id, params)
-            st.success("Deal assumptions saved; Actual drawdown allocations have been synced to the Investor Portal.")
+            st.success("Deal assumptions saved; actual drawdown allocations have been synced to the Investor Portal.")
 
         due_breaches = schedule_df[schedule_df["Covenant_Breach"]]
         if not due_breaches.empty:
