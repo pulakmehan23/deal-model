@@ -1136,6 +1136,9 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
     capitalisation_interval = max(1, min(max(1, len(schedule_df)), capitalisation_interval))
 
     balances = {name: 0.0 for name in investor_names}
+    # Original investor principal is tracked separately from capitalised return so a
+    # maturity payoff can report principal back and interest paid as distinct amounts.
+    principal_basis = {name: 0.0 for name in investor_names}
     capitalised_interest_pending = {name: 0.0 for name in investor_names}
     total_funded = {name: 0.0 for name in investor_names}
     total_interest = {name: 0.0 for name in investor_names}
@@ -1217,8 +1220,29 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
         period_buyout_out = {name: 0.0 for name in investor_names}
         has_actual_principal = False
 
+        def register_principal_repayment(name, flow_date, amount, flow_type):
+            """Separate returned contributed capital from repayment of capitalised return."""
+            amount = max(0.0, float(amount or 0.0))
+            if amount <= 0:
+                return
+            principal_basis.setdefault(name, 0.0)
+            if investor_interest_capitalised:
+                principal_component = min(amount, max(0.0, principal_basis[name]))
+                interest_component = max(0.0, amount - principal_component)
+                principal_basis[name] = max(0.0, principal_basis[name] - principal_component)
+                if principal_component > 0:
+                    period_principal_returns[name] = period_principal_returns.get(name, 0.0) + principal_component
+                    record_flow(name, flow_date, flow_type, principal_component, principal_component)
+                if interest_component > 0:
+                    period_interest_paid[name] = period_interest_paid.get(name, 0.0) + interest_component
+                    record_flow(name, flow_date, "Interest Distribution", interest_component, interest_component)
+            else:
+                period_principal_returns[name] = period_principal_returns.get(name, 0.0) + amount
+                record_flow(name, flow_date, flow_type, amount, amount)
+
         for name, amount in allocations.items():
             balances[name] = balances.get(name, 0.0) + amount
+            principal_basis[name] = principal_basis.get(name, 0.0) + amount
             total_funded[name] = total_funded.get(name, 0.0) + amount
             if amount > 0:
                 record_flow(name, draw_date, "Capital Call", amount, -amount)
@@ -1263,16 +1287,17 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
                 has_actual_principal = True
                 returned = min(amount, max(balances[investor_name], 0.0))
                 balances[investor_name] = max(0.0, balances[investor_name] - returned)
-                period_principal_returns[investor_name] += returned
-                record_flow(investor_name, tx_date, "Principal Repayment", returned, returned)
+                register_principal_repayment(investor_name, tx_date, returned, "Principal Repayment")
             elif tx_type == "Other Increase":
                 balances[investor_name] += amount
+                principal_basis[investor_name] = principal_basis.get(investor_name, 0.0) + amount
                 total_funded[investor_name] += amount
                 period_other_increase[investor_name] += amount
                 record_flow(investor_name, tx_date, "Other Increase", amount, -amount)
             elif tx_type == "Other Decrease":
                 decreased = min(amount, max(balances[investor_name], 0.0))
                 balances[investor_name] = max(0.0, balances[investor_name] - decreased)
+                principal_basis[investor_name] = max(0.0, principal_basis.get(investor_name, 0.0) - decreased)
                 period_other_decrease[investor_name] += decreased
                 record_flow(investor_name, tx_date, "Other Decrease", decreased, decreased)
             elif tx_type == "Buyout":
@@ -1290,7 +1315,11 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
                 period_other_decrease.setdefault(counterparty, 0.0)
                 period_principal_returns.setdefault(counterparty, 0.0)
                 period_interest_actual.setdefault(counterparty, 0.0)
+                principal_basis.setdefault(counterparty, 0.0)
                 transferred = min(amount, max(balances[investor_name], 0.0))
+                principal_transferred = min(transferred, max(0.0, principal_basis.get(investor_name, 0.0)))
+                principal_basis[investor_name] = max(0.0, principal_basis.get(investor_name, 0.0) - principal_transferred)
+                principal_basis[counterparty] += principal_transferred
                 balances[investor_name] = max(0.0, balances[investor_name] - transferred)
                 balances[counterparty] += transferred
                 period_buyout_out[investor_name] += transferred
@@ -1413,8 +1442,7 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
                         if returned <= 0:
                             continue
                         balances[name] = max(0.0, balances[name] - returned)
-                        period_principal_returns[name] = period_principal_returns.get(name, 0.0) + returned
-                        record_flow(name, receipt_date, "Principal Repayment", returned, returned)
+                        register_principal_repayment(name, receipt_date, returned, "Principal Repayment")
                     total_balance = sum(max(0.0, balance) for balance in balances.values())
                     remaining_principal -= cap
                 if remaining_principal > 0.01:
@@ -1426,28 +1454,25 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
                             if returned <= 0:
                                 continue
                             balances[name] = max(0.0, balances[name] - returned)
-                            period_principal_returns[name] = period_principal_returns.get(name, 0.0) + returned
-                            record_flow(name, payment_date, "Principal Repayment", returned, returned)
+                            register_principal_repayment(name, payment_date, returned, "Principal Repayment")
             elif actual_principal_amount > 0:
                 principal_due = min(actual_principal_amount, sum(max(0.0, balance) for balance in balances.values()))
                 total_balance = sum(max(0.0, balance) for balance in balances.values())
                 if total_balance > 0:
                     for name in list(balances):
                         returned = min(max(0.0, balances[name]), principal_due * max(0.0, balances[name]) / total_balance)
-                        period_principal_returns[name] = period_principal_returns.get(name, 0.0) + returned
                         balances[name] = max(0.0, balances[name] - returned)
                         if returned > 0:
-                            record_flow(name, payment_date, "Principal Repayment", returned, returned)
+                            register_principal_repayment(name, payment_date, returned, "Principal Repayment")
         if not has_actual_principal and not has_schedule_actual_interest:
             total_balance = sum(max(0.0, balance) for balance in balances.values())
             principal_due = min(float(schedule_row.get("Principal_Applied", 0.0)), total_balance)
             if total_balance > 0 and principal_due > 0:
                 for name in list(balances):
                     returned = min(max(0.0, balances[name]), principal_due * max(0.0, balances[name]) / total_balance)
-                    period_principal_returns[name] = period_principal_returns.get(name, 0.0) + returned
                     balances[name] = max(0.0, balances[name] - returned)
                     if returned > 0:
-                        record_flow(name, payment_date, "Scheduled Principal Return", returned, returned)
+                        register_principal_repayment(name, payment_date, returned, "Scheduled Principal Return")
 
         for name in list(balances):
             returned = float(period_principal_returns.get(name, 0.0))
@@ -3358,7 +3383,7 @@ def page_modeler():
     with tabs[5]:
         st.subheader("Investor base and returns")
         st.caption(f"Investor target returns are individual; the {loan_ranking} return is applied for this tranche. See Setup & Terms → Returns & Allocation for each investor’s rate and the alternate-ranking default.")
-        st.info("Standard rows use the tranche ranking: Senior 50% / 15% / 35% (BPCFMC / BPCFLC / CBCF), or Mezzanine 80% / 20% (BPCFMC / BPCFLC). Investor Ledger and Manual rows use their recorded/entered splits. In Serviced mode, projected investor interest is paid only when borrower servicing is projected; actual-period payments are limited to borrower interest actually collected. In Capitalised mode, investor interest is added to investor balances at the selected capitalisation interval, with no forecast cash interest paid. Buyouts and actual repayments are applied from Investor Portal transactions.")
+        st.info("Standard rows use the tranche ranking: Senior 50% / 15% / 35% (BPCFMC / BPCFLC / CBCF), or Mezzanine 80% / 20% (BPCFMC / BPCFLC). Investor Ledger and Manual rows use their recorded/entered splits. In Serviced mode, projected investor interest is paid only when borrower servicing is projected; actual-period payments are limited to borrower interest actually collected. In Capitalised mode, investor interest is added to balances at the selected interval. At repayment, contributed capital is shown under Principal Returned and any capitalised interest settled is shown under Interest Paid. Buyouts and actual repayments are applied from Investor Portal transactions.")
         summary_format = {"Total_Funded": "${:,.0f}", "Total_Interest_Earned": "${:,.0f}",
             "Total_Principal_Returned": "${:,.0f}", "Outstanding_Balance": "${:,.0f}",
             "Target_XIRR": "{:.2f}%", "Actual_XIRR": "{:.2f}%"}
