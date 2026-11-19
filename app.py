@@ -391,17 +391,17 @@ def init_db():
             "loan_ranking": "Senior", "borrower_irr": 12.0, "cpr": 0.0,
             "principal_repayment_mode": "Bullet at maturity",
             "principal_repayment_schedule": [],
-            "interest_treatment": "Serviced", "interest_advance_months": 1,
+            "interest_treatment": "Capitalised", "interest_advance_months": 1,
             "construction_months": 0, "interest_only_months": 0,
             "drawdown_profile": "Automatic", "s_curve_steepness": 5.0,
-            "estab_fee_pct": 1.5, "line_fee_pct": 0.5,
-            "admin_fee_monthly": 500.0, "discharge_fee": 1500.0,
-            "risk_review_fee": 2500.0, "legal_fee": 3500.0,
+            "estab_fee_pct": 2.0, "line_fee_pct": 0.5,
+            "admin_fee_monthly": 0.0, "discharge_fee": 0.0,
+            "risk_review_fee": 0.0, "legal_fee": 0.0,
             "other_upfront_fees": 0.0, "restructure_fee": 0.0,
             "pv_growth_annual": 3.0, "covenant_lvr": 75.0,
             "default_investor_target_irr": 8.0,
             "drawdown_schedule": json.dumps({demo_settlement.isoformat(): {
-                "gross_draw": 10_000_000.0, "allocation_source": "Standard",
+                "gross_draw": 9_000_000.0, "allocation_source": "Standard",
                 "status": "Forecast", "allocations": {}}}),
         }
         conn.execute("""INSERT INTO deals (borrower_id, deal_name, facility_name, parent_deal_id,
@@ -614,10 +614,10 @@ def build_drawdown_matrix(template_df, raw_schedule, actual_calls, investor_name
     first_draw_index = next((i for i, row in enumerate(rows) if row["Gross Drawdown"] > 0), None)
     for index, row in enumerate(rows):
         upfront = min(float(upfront_total), row["Gross Drawdown"]) if index == first_draw_index else 0.0
-        net_to_allocate = max(0.0, row["Gross Drawdown"] - upfront)
+        investor_funding_required = max(0.0, row["Gross Drawdown"] + upfront)
         key = row["Drawdown Date"].isoformat()
         if row["Allocation Source"] == "Standard":
-            allocations = default_allocation_amounts(net_to_allocate, loan_ranking, investor_names)
+            allocations = default_allocation_amounts(investor_funding_required, loan_ranking, investor_names)
         elif row["Allocation Source"] == "Investor Ledger":
             allocations = {name: float(actual_calls.get(key, {}).get(name, 0.0)) for name in investor_names}
         else:
@@ -627,7 +627,7 @@ def build_drawdown_matrix(template_df, raw_schedule, actual_calls, investor_name
                 allocations = {name: float(actual_calls[key].get(name, 0.0)) for name in investor_names}
         for name in investor_names:
             row[allocation_column(name)] = max(0.0, allocations.get(name, 0.0))
-        row["_net_to_allocate"] = net_to_allocate
+        row["_net_to_allocate"] = investor_funding_required
         row["_prior_allocations"] = None
     return pd.DataFrame(rows)
 
@@ -653,11 +653,11 @@ def effective_drawdown_plan(edited_plan, investor_names, actual_calls, loan_rank
         key = draw_date.isoformat()
         gross = gross_values[index]
         upfront = min(float(upfront_total), gross) if index == first_draw_index else 0.0
-        net_to_allocate = max(0.0, gross - upfront)
+        investor_funding_required = max(0.0, gross + upfront)
         source = str(row.get("Allocation Source", "Standard"))
         status = str(row.get("Status", "Forecast"))
         if source == "Standard":
-            allocations = default_allocation_amounts(net_to_allocate, loan_ranking, investor_names)
+            allocations = default_allocation_amounts(investor_funding_required, loan_ranking, investor_names)
         elif source == "Investor Ledger":
             allocations = {name: float(actual_calls.get(key, {}).get(name, 0.0)) for name in investor_names}
         else:
@@ -671,11 +671,11 @@ def effective_drawdown_plan(edited_plan, investor_names, actual_calls, loan_rank
         result[key] = {"gross_draw": gross, "status": status,
             "allocation_source": source, "allocations": allocations}
         summary = {"Drawdown Date": draw_date, "Status": status, "Allocation Source": source,
-            "Gross Drawdown": gross, "Upfront Fees Netted": upfront,
-            "Net Amount to Allocate": net_to_allocate}
+            "Gross Drawdown": gross, "Upfront Costs Funded": upfront,
+            "Investor Funding Required": investor_funding_required}
         for name in investor_names:
             summary[name] = allocations.get(name, 0.0)
-        summary["Allocation Difference"] = net_to_allocate - allocated
+        summary["Allocation Difference"] = investor_funding_required - allocated
         display_rows.append(summary)
     return result, pd.DataFrame(display_rows)
 
@@ -755,6 +755,10 @@ def build_schedule(params, actuals_map, drawdown_map):
     fees = compute_fees(params)
     raw_interest_treatment = str(params.get("interest_treatment", "Serviced")).strip().lower()
     interest_treatment = "Capitalised" if raw_interest_treatment in ["capitalised", "capitalized"] else "Serviced"
+    # Only capitalised fees/interest consume the peak-balance cap. For the
+    # Capitalised scenario, reserve scheduled charges before allocating interest capacity.
+    projected_fee_cap_reserve = ((fees["admin_total_estimate"] + fees["line_fee_estimate"]
+        + fees["discharge"]) if interest_treatment == "Capitalised" else 0.0)
     advance_setting = params.get("interest_advance_months", 1)
     all_interest_in_advance = str(advance_setting).strip().lower() == "all"
     try:
@@ -762,8 +766,17 @@ def build_schedule(params, actuals_map, drawdown_map):
     except (TypeError, ValueError):
         advance_months = 1
     capitalisation_interval = advance_months if interest_treatment == "Capitalised" else 1
+    first_planned_draw = 0.0
+    for plan_key, plan_value in sorted(drawdown_map.items()):
+        if isinstance(plan_value, dict):
+            candidate_draw = max(0.0, float(plan_value.get("gross_draw", plan_value.get("amount", 0.0)) or 0.0))
+        else:
+            candidate_draw = max(0.0, float(plan_value or 0.0))
+        if candidate_draw > 0:
+            first_planned_draw = candidate_draw
+            break
     initial_advance_interest = (initial_advance_interest_amount(
-        facility_amount, annual_rate, settlement, advance_months)
+        first_planned_draw or facility_amount, annual_rate, settlement, advance_months)
         if interest_treatment == "Serviced" else 0.0)
     net_advance_interest_from_proceeds = (interest_treatment == "Serviced"
         and all_interest_in_advance
@@ -772,6 +785,11 @@ def build_schedule(params, actuals_map, drawdown_map):
     rows = []
     balance = 0.0
     cumulative_drawn = 0.0
+    cumulative_upfront_funded = 0.0
+    cumulative_cap_fee_charges = 0.0
+    cumulative_interest_charged = 0.0
+    cumulative_borrower_principal_repaid = 0.0
+    cumulative_upfront_fees_repaid = 0.0
     cumulative_interest = 0.0
     capitalised_interest_pending = 0.0
     arrears = 0.0
@@ -821,17 +839,46 @@ def build_schedule(params, actuals_map, drawdown_map):
             gross_draw = planned_draw
 
         opening_balance = balance
+        actual_draw_override = bool(actual.get("drawdown_override", False))
+        if interest_treatment == "Serviced":
+            # Cash-serviced interest and cash-billed fees do not enlarge peak outstanding.
+            cap_room_before_draw = max(0.0, facility_amount - opening_balance)
+        else:
+            fees_reserved_for_draw = max(projected_fee_cap_reserve, cumulative_cap_fee_charges)
+            cap_room_before_draw = max(0.0, facility_amount - cumulative_drawn
+                - cumulative_upfront_funded - fees_reserved_for_draw - cumulative_interest_charged)
+        if not actual_draw_override:
+            gross_draw = min(gross_draw, cap_room_before_draw)
         upfront_deducted = 0.0
         is_first_draw = gross_draw > 0 and not first_draw_done
         if is_first_draw:
-            upfront_deducted = min(fees["upfront_total"], gross_draw)
+            if interest_treatment == "Serviced":
+                upfront_room = max(0.0, facility_amount - opening_balance - gross_draw)
+            else:
+                upfront_room = max(0.0, facility_amount - cumulative_drawn - gross_draw
+                    - cumulative_upfront_funded - max(projected_fee_cap_reserve, cumulative_cap_fee_charges)
+                    - cumulative_interest_charged)
+            upfront_deducted = min(fees["upfront_total"], upfront_room)
             first_draw_done = True
-        investor_funding = max(0.0, gross_draw - upfront_deducted)
+        investor_funding = max(0.0, gross_draw + upfront_deducted)
         advance_interest_withheld = (min(initial_advance_interest, investor_funding)
             if index == 0 and is_first_draw and net_advance_interest_from_proceeds else 0.0)
-        net_draw = max(0.0, investor_funding - advance_interest_withheld)
-        balance_after_draw = opening_balance + gross_draw
+        net_draw = max(0.0, gross_draw - advance_interest_withheld)
+        balance_after_draw = opening_balance + gross_draw + upfront_deducted
         cumulative_drawn += gross_draw
+        cumulative_upfront_funded += upfront_deducted
+
+        # Capitalised-treatment fees consume capacity inside the peak/outstanding cap.
+        arrears_opening = arrears
+        in_construction = facility_type == "Construction" and index < construction_months
+        in_interest_only = index < interest_only_months
+        undrawn = max(0.0, facility_amount - cumulative_drawn - cumulative_upfront_funded
+            - cumulative_cap_fee_charges - cumulative_interest_charged)
+        line_fee = (undrawn * fees["line_fee_rate"] * (days / 365.0)
+                    if in_construction and not after_payoff else 0.0)
+        admin_fee = fees["admin_monthly"] if not after_payoff else 0.0
+        discharge_fee = fees["discharge"] if index == term - 1 and not after_payoff else 0.0
+        current_cap_fee_charges = line_fee + admin_fee + discharge_fee
 
         if after_payoff:
             interest_accrued = 0.0
@@ -847,8 +894,15 @@ def build_schedule(params, actuals_map, drawdown_map):
                 # principal receipts reduce the balance for the next forecast period.
                 interest_accrued = balance_after_draw * annual_rate_for_days(annual_rate, days)
         else:
-            interest_principal = facility_amount if index < advance_months else balance_after_draw
+            interest_principal = (max(0.0, cumulative_drawn)
+                if index < advance_months else balance_after_draw)
             interest_accrued = interest_principal * annual_rate_for_days(annual_rate, days)
+        if interest_treatment == "Capitalised" and not bool(actual.get("payment_actuals_logged", False)):
+            fees_reserved_within_cap = max(projected_fee_cap_reserve,
+                cumulative_cap_fee_charges + current_cap_fee_charges)
+            available_for_interest = max(0.0, facility_amount - cumulative_drawn
+                - cumulative_upfront_funded - fees_reserved_within_cap - cumulative_interest_charged)
+            interest_accrued = min(interest_accrued, available_for_interest)
         if after_payoff or interest_treatment == "Capitalised":
             interest_due = 0.0
         elif index == 0:
@@ -857,6 +911,9 @@ def build_schedule(params, actuals_map, drawdown_map):
             interest_due = 0.0
         else:
             interest_due = interest_accrued
+        if interest_treatment == "Capitalised":
+            cumulative_interest_charged += interest_accrued
+        cumulative_cap_fee_charges += current_cap_fee_charges
         if interest_treatment == "Capitalised":
             capitalised_interest_pending += interest_accrued
             capitalize_now = ((index + 1) % capitalisation_interval == 0
@@ -868,16 +925,6 @@ def build_schedule(params, actuals_map, drawdown_map):
             capitalised_interest = 0.0
         balance_after_capitalisation = balance_after_draw + capitalised_interest
         principal_base = balance_after_capitalisation
-
-        # Construction timing controls construction drawdowns/fees; principal grace is independent.
-        arrears_opening = arrears
-        in_construction = facility_type == "Construction" and index < construction_months
-        in_interest_only = index < interest_only_months
-        undrawn = max(facility_amount - cumulative_drawn, 0.0)
-        line_fee = (undrawn * fees["line_fee_rate"] * (days / 365.0)
-                    if in_construction and not after_payoff else 0.0)
-        admin_fee = fees["admin_monthly"] if not after_payoff else 0.0
-        discharge_fee = fees["discharge"] if index == term - 1 and not after_payoff else 0.0
 
         smm = 1.0 - (1.0 - cpr) ** (days / 365.0) if cpr > 0 else 0.0
         prepayment = principal_base * smm if not after_payoff and not in_interest_only and principal_base > 0 else 0.0
@@ -960,6 +1007,24 @@ def build_schedule(params, actuals_map, drawdown_map):
             cash_fees_received = line_fee + admin_fee + discharge_fee
         if has_payment_actuals:
             cash_interest_advance = 0.0
+            cash_principal_received = float(actual_principal or 0.0)
+            cash_capitalised_interest_received = 0.0
+            cumulative_borrower_principal_repaid += cash_principal_received
+            cash_upfront_fee_received = 0.0
+        else:
+            borrower_principal_remaining = max(0.0,
+                cumulative_drawn - cumulative_borrower_principal_repaid)
+            cash_principal_received = min(contract_principal, borrower_principal_remaining)
+            after_principal = max(0.0, contract_principal - cash_principal_received)
+            upfront_fee_remaining = max(0.0,
+                cumulative_upfront_funded - cumulative_upfront_fees_repaid)
+            cash_upfront_fee_received = min(after_principal, upfront_fee_remaining)
+            cash_capitalised_interest_received = max(0.0,
+                after_principal - cash_upfront_fee_received)
+            cumulative_borrower_principal_repaid += cash_principal_received
+            cumulative_upfront_fees_repaid += cash_upfront_fee_received
+            cash_fees_received += cash_upfront_fee_received
+            cash_interest_received += cash_capitalised_interest_received
         total_due = (arrears_opening + cash_servicing_interest_due + penalty_interest + contract_principal
                      + line_fee + admin_fee + discharge_fee)
 
@@ -1034,6 +1099,7 @@ def build_schedule(params, actuals_map, drawdown_map):
             "Cash_Interest_Received": cash_interest_received,
             "Cash_Penalty_Interest_Received": float(actual_penalty_interest or 0.0) if has_payment_actuals else penalty_interest,
             "Cash_Interest_Advance": cash_interest_advance,
+            "Cash_Capitalised_Interest_Received": cash_capitalised_interest_received,
             "Cash_Arrears_Interest": float(actual_penalty_interest or 0.0) if has_payment_actuals else penalty_interest,
             "Cash_Principal_Received": cash_principal_received,
             "Cash_Fees_Received": cash_fees_received,
@@ -1531,6 +1597,8 @@ def build_pnl(schedule_df, fees, investor_summary_df, params):
         + fees["establishment"] + fees["legal_fee"] + fees["risk_review"]
         + fees["other_upfront"] + fees["discharge"] + fees["restructure"])
     investor_expense = float(investor_summary_df["Total_Interest_Earned"].sum()) if len(investor_summary_df) else 0.0
+    upfront_cost_expense = (float(schedule_df["Upfront_Fees_Deducted"].sum())
+        if "Upfront_Fees_Deducted" in schedule_df.columns else float(fees["upfront_total"]))
     total_funded = float(investor_summary_df["Total_Funded"].sum()) if len(investor_summary_df) else 0.0
     weighted_cost = 0.0
     if total_funded > 0:
@@ -1550,7 +1618,8 @@ def build_pnl(schedule_df, fees, investor_summary_df, params):
         "Restructure Fee": fees["restructure"],
         "Total Income": total_income,
         "Investor Interest Expense": investor_expense,
-        "Net Revenue": total_income - investor_expense,
+        "Upfront Cost Expense": upfront_cost_expense,
+        "Net Revenue": total_income - investor_expense - upfront_cost_expense,
         "Borrower Rate (%)": borrower_rate,
         "Weighted Investor Target (%)": weighted_cost,
         "Platform Spread (bps)": (borrower_rate - weighted_cost) * 100.0,
@@ -1561,7 +1630,7 @@ def build_cashflows(schedule_df, investor_ledger_df, fees, investor_cashflows=No
                     borrower_receipt_allocations_df=None):
     columns = ["Investor_Capital_Called", "Investor_Other_Increase", "Borrower_Interest_Received",
         "Borrower_Principal_Received", "Borrower_Fees_Received", "Total_Inflow",
-        "Net_Disbursed_to_Borrower", "Investor_Interest_Paid", "Investor_Principal_Returned",
+        "Net_Disbursed_to_Borrower", "Upfront_Costs_Paid", "Investor_Interest_Paid", "Investor_Principal_Returned",
         "Investor_Other_Decrease", "Total_Outflow", "Net_SPV_Cashflow", "Cumulative_SPV_Cash"]
     events = {}
     borrower_receipt_allocations_df = (borrower_receipt_allocations_df
@@ -1585,7 +1654,7 @@ def build_cashflows(schedule_df, investor_ledger_df, fees, investor_cashflows=No
         draw_event = bucket(draw_date)
         draw_event["Net_Disbursed_to_Borrower"] += float(row["Drawdown_Net"])
         if float(row["Upfront_Fees_Deducted"]) > 0:
-            draw_event["Borrower_Fees_Received"] += float(row["Upfront_Fees_Deducted"])
+            draw_event["Upfront_Costs_Paid"] += float(row["Upfront_Fees_Deducted"])
 
         period_receipts = receipts_by_period.get(payment_date.isoformat(), [])
         actual_fields = [row.get(name) for name in
@@ -1625,6 +1694,7 @@ def build_cashflows(schedule_df, investor_ledger_df, fees, investor_cashflows=No
             bucket(interest_date)["Borrower_Interest_Received"] += float(row.get("Cash_Interest_Advance", 0.0) or 0.0)
             payment_event = bucket(payment_date)
             payment_event["Borrower_Interest_Received"] += float(row.get("Cash_Arrears_Interest", 0.0) or 0.0)
+            payment_event["Borrower_Interest_Received"] += float(row.get("Cash_Capitalised_Interest_Received", 0.0) or 0.0)
             payment_event["Borrower_Principal_Received"] += float(row["Cash_Principal_Received"])
             payment_event["Borrower_Fees_Received"] += float(row["Cash_Fees_Received"])
 
@@ -1660,7 +1730,8 @@ def build_cashflows(schedule_df, investor_ledger_df, fees, investor_cashflows=No
         row["Total_Inflow"] = (row["Investor_Capital_Called"] + row["Investor_Other_Increase"]
             + row["Borrower_Interest_Received"] + row["Borrower_Principal_Received"]
             + row["Borrower_Fees_Received"])
-        row["Total_Outflow"] = (row["Net_Disbursed_to_Borrower"] + row["Investor_Interest_Paid"]
+        row["Total_Outflow"] = (row["Net_Disbursed_to_Borrower"] + row["Upfront_Costs_Paid"]
+            + row["Investor_Interest_Paid"]
             + row["Investor_Principal_Returned"] + row["Investor_Other_Decrease"])
         row["Net_SPV_Cashflow"] = row["Total_Inflow"] - row["Total_Outflow"]
         cumulative += row["Net_SPV_Cashflow"]
@@ -2119,8 +2190,9 @@ def default_facility_model_params(facility_row):
         first_draw = next((index for index, amount in enumerate(template["Drawdown Amount"].tolist()) if amount > 0), None)
         for index, row in template.iterrows():
             gross = float(row["Drawdown Amount"])
-            net = max(0.0, gross - (min(upfront, gross) if index == first_draw else 0.0))
-            allocations = default_allocation_amounts(net, params["loan_ranking"], ["BPCFMC", "BPCFLC", "CBCF"])
+            funded_upfront = min(upfront, gross) if index == first_draw else 0.0
+            allocations = default_allocation_amounts(gross + funded_upfront,
+                params["loan_ranking"], ["BPCFMC", "BPCFLC", "CBCF"])
             plan[parse_date(row["Drawdown Date"]).isoformat()] = {"gross_draw": gross,
                 "allocation_source": "Standard", "status": "Forecast", "allocations": allocations}
         params["drawdown_schedule"] = json.dumps(plan)
@@ -2678,8 +2750,8 @@ def page_modeler():
                 st.session_state[prefix + "facility_type"] = facility_type_default
             facility_type = c1.selectbox("Facility type", FACILITY_TYPES, key=prefix + "facility_type")
             init_widget_state(prefix + "facility_amount", facility_default)
-            facility_amount = c2.number_input("Facility amount", min_value=0.0, max_value=10_000_000_000.0,
-                step=100_000.0, key=prefix + "facility_amount", help="The drawdown plan is checked against this limit.")
+            facility_amount = c2.number_input("Facility limit", min_value=0.0, max_value=10_000_000_000.0,
+                step=100_000.0, key=prefix + "facility_amount", help="The facility limit constrains peak outstanding. Financed upfront costs and capitalised interest count against it; cash-serviced interest does not increase outstanding balance.")
             init_widget_state(prefix + "property_value", property_default)
             property_value = c3.number_input("Property / security value", min_value=0.0,
                 max_value=10_000_000_000.0, step=100_000.0, key=prefix + "property_value")
@@ -2702,7 +2774,7 @@ def page_modeler():
             init_widget_state(prefix + "interest_treatment", treatment_default)
             interest_treatment = st.selectbox("Interest treatment", ["Serviced", "Capitalised"],
                 key=prefix + "interest_treatment",
-                help="Serviced interest is billed in advance. Capitalised interest accrues on ACT/365 and is added to principal at the selected interval, with no cash interest collected up front.")
+                help="Serviced: borrower pays interest in cash and it does not increase peak outstanding, allowing a larger draw; lifetime cash paid may exceed the facility limit. Capitalised: interest is added to principal and must fit inside the cap.")
 
             stored_advance = existing_params.get("interest_advance_months", 1)
             all_advance_default = str(stored_advance).strip().lower() == "all"
@@ -3078,6 +3150,39 @@ def page_modeler():
                 if investor_name not in investor_names:
                     investor_names.append(investor_name)
     upfront_total = compute_fees(params)["upfront_total"]
+    drawdown_plan_source = existing_params.get("drawdown_schedule", {})
+    # The seeded $10m illustration sizes its settlement draw according to treatment:
+    # reserve 8% of the cap when interest capitalises; when serviced, cash interest
+    # does not consume peak outstanding capacity, so the undrawn capacity can be drawn.
+    previous_treatment = str(existing_params.get("interest_treatment", "Capitalised"))
+    current_treatment = str(interest_treatment)
+    if (existing_params.get("seed_key") == "demo_bridging_10m_bullet_v1"
+            and previous_treatment != current_treatment):
+        plan_to_resize = safe_json(drawdown_plan_source, {})
+        if isinstance(plan_to_resize, dict):
+            nonzero_rows = []
+            for date_key, plan_item in plan_to_resize.items():
+                item = plan_item if isinstance(plan_item, dict) else {"gross_draw": plan_item}
+                amount = max(0.0, float(item.get("gross_draw", item.get("amount", 0.0)) or 0.0))
+                if amount > 0.01:
+                    nonzero_rows.append((date_key, item, amount))
+            old_params = dict(existing_params)
+            old_limit = float(old_params.get("facility_amount", facility_amount) or facility_amount)
+            previous_upfront = compute_fees(old_params)["upfront_total"]
+            previous_mode = ("Capitalised" if previous_treatment.strip().lower() in
+                             ["capitalised", "capitalized"] else "Serviced")
+            expected_previous_draw = (max(0.0, old_limit - previous_upfront)
+                if previous_mode == "Serviced" else max(0.0, old_limit - previous_upfront - 0.08 * old_limit))
+            if (len(nonzero_rows) == 1
+                    and abs(nonzero_rows[0][2] - expected_previous_draw) <= 0.01
+                    and str(nonzero_rows[0][1].get("allocation_source", "Standard")) == "Standard"
+                    and str(nonzero_rows[0][1].get("status", "Forecast")) == "Forecast"):
+                target_draw = (max(0.0, float(facility_amount) - upfront_total)
+                    if current_treatment == "Serviced" else
+                    max(0.0, float(facility_amount) - upfront_total - 0.08 * float(facility_amount)))
+                nonzero_rows[0][1]["gross_draw"] = target_draw
+                plan_to_resize[nonzero_rows[0][0]] = nonzero_rows[0][1]
+                drawdown_plan_source = json.dumps(plan_to_resize)
     force_template_key = prefix + "force_drawdown_template"
     reset_count_key = prefix + "drawdown_reset_count"
     init_widget_state(force_template_key, False)
@@ -3092,15 +3197,15 @@ def page_modeler():
         profile_description = (f"Construction S-curve over up to {max(1, int(construction_months))} draw dates."
             if resolved_profile == "S-curve" else
             f"Straight-line over up to {max(1, int(construction_months))} draw dates."
-            if resolved_profile == "Straight-line" else "Full draw at settlement by default.")
+            if resolved_profile == "Straight-line" else "Single borrower draw at settlement by default; investors also fund actual upfront costs.")
         standard_text = ("Senior default: 50% BPCFMC / 15% BPCFLC / 35% CBCF."
             if loan_ranking == "Senior" else "Mezz default: 80% BPCFMC / 20% BPCFLC; CBCF is excluded by default.")
-        st.markdown(f'<div class="section-note">{profile_description} {standard_text} Optional investors are included only when attached to this deal. Choose Standard, Investor Ledger or Manual for each row. Manual allocations are editable dollar amounts and should reconcile to the net amount to allocate.</div>',
+        st.markdown(f'<div class="section-note">{profile_description} {standard_text} Optional investors are included only when attached to this deal. Choose Standard, Investor Ledger or Manual for each row. Manual allocations are editable dollar amounts and should reconcile to borrower draw plus any upfront costs funded at settlement.</div>',
                     unsafe_allow_html=True)
-        st.caption("Investor Ledger rows use Capital Call movements recorded in the Investor Portal. Forecast rows default to the Senior/Mezz split. Choose Manual to override a row; the model checks each row against the net funding amount after upfront fee netting.")
-        if net_advance_interest_from_proceeds:
-            st.info("For this all-term Serviced Bridging / Residual Stock facility, investor funding remains gross draw less upfront fees. Prepaid interest is withheld separately from the borrower’s initial proceeds in the Loan Schedule.")
-
+        if interest_treatment == "Serviced":
+            st.caption("Serviced interest is paid in cash and does not consume peak outstanding capacity. The borrower draw can use the facility limit less upfront costs funded at settlement; lifetime cash paid may exceed the limit.")
+        else:
+            st.caption("Investor Ledger rows use Capital Call movements recorded in the Investor Portal. Forecast rows default to the Senior/Mezz split. Required capital calls equal borrower draw plus upfront costs. Remaining capacity is reserved within the cap for capitalised interest and other charges.")
         reset_clicked = st.button("Reset to suggested schedule", key=prefix + "reset_drawdown_button")
         if reset_clicked:
             st.session_state[force_template_key] = True
@@ -3109,7 +3214,7 @@ def page_modeler():
 
         use_template = bool(st.session_state.get(force_template_key, False)) or (
             stored_signature is not None and stored_signature != signature)
-        initial_matrix = build_drawdown_matrix(template, existing_params.get("drawdown_schedule", {}),
+        initial_matrix = build_drawdown_matrix(template, drawdown_plan_source,
             actual_capital_calls, investor_names, loan_ranking, upfront_total, settlement, use_template)
         initial_matrix = initial_matrix.drop(columns=["_prior_allocations", "_net_to_allocate"], errors="ignore")
         st.session_state[force_template_key] = False
@@ -3120,7 +3225,7 @@ def page_modeler():
             "Status": st.column_config.SelectboxColumn("Actual / forecast", options=["Forecast", "Actual"], required=True),
             "Allocation Source": st.column_config.SelectboxColumn("Allocation source",
                 options=["Standard", "Investor Ledger", "Manual"], required=True),
-            "Gross Drawdown": st.column_config.NumberColumn("Gross drawdown", min_value=0.0,
+            "Gross Drawdown": st.column_config.NumberColumn("Borrower cash draw", min_value=0.0,
                 max_value=max(float(facility_amount), 0.0), step=10_000.0, format="$%.0f", required=True),
         }
         for investor_name in investor_names:
@@ -3133,19 +3238,20 @@ def page_modeler():
             actual_capital_calls, loan_ranking, upfront_total)
 
         gross_total = float(plan_summary["Gross Drawdown"].sum()) if not plan_summary.empty else 0.0
-        net_total = float(plan_summary["Net Amount to Allocate"].sum()) if not plan_summary.empty else 0.0
+        net_total = float(plan_summary["Investor Funding Required"].sum()) if not plan_summary.empty else 0.0
         allocation_total = float(plan_summary[investor_names].sum().sum()) if investor_names and not plan_summary.empty else 0.0
+        capacity_left = float(facility_amount) - net_total
         s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Gross draws", money(gross_total))
-        s2.metric("Net to investors", money(net_total))
-        s3.metric("Allocated to investors", money(allocation_total))
-        s4.metric("Unallocated / overallocated", money(net_total - allocation_total))
-        if gross_total > float(facility_amount) + 0.01:
-            st.error("Total gross drawdowns exceed the facility amount.")
+        s1.metric("Borrower cash draw", money(gross_total))
+        s2.metric("Investor funding required", money(net_total))
+        s3.metric("Peak cap headroom" if interest_treatment == "Serviced" else "Capacity left for interest / fees", money(capacity_left))
+        s4.metric("Allocation variance", money(net_total - allocation_total))
+        if net_total > float(facility_amount) + 0.01:
+            st.error("Borrower draws plus upfront costs exceed the facility's peak limit.")
         allocation_issues = plan_summary[plan_summary["Allocation Difference"].abs() > 0.01] if not plan_summary.empty else pd.DataFrame()
         if not allocation_issues.empty:
             issue_dates = ", ".join(value.strftime("%d %b %Y") for value in allocation_issues["Drawdown Date"])
-            st.warning(f"Investor allocations do not reconcile to net funding on: {issue_dates}. Check the row’s Allocation Source or adjust its investor amounts.")
+            st.warning(f"Investor allocations do not reconcile to investor funding required (borrower draw plus upfront costs) on: {issue_dates}. Check the row’s Allocation Source or adjust its investor amounts.")
 
         summary_format = {column: "${:,.0f}" for column in plan_summary.columns
                           if column not in ["Drawdown Date", "Status", "Allocation Source"]}
@@ -3199,8 +3305,8 @@ def page_modeler():
         st.subheader("Live deal overview")
         st.caption("All figures below use the current on-screen assumptions and drawdown plan. Changes autosave; the button below can also be used to force a save.")
         k1, k2, k3, k4, k5, k6 = st.columns(6)
-        k1.metric("Tranche Amount", money(facility_amount))
-        k2.metric("Gross drawn", money(schedule_df["Drawdown_Gross"].sum()))
+        k1.metric("Facility limit", money(facility_amount))
+        k2.metric("Borrower cash drawn", money(schedule_df["Drawdown_Gross"].sum()))
         k3.metric("Outstanding at maturity", money(schedule_df["Ending_Balance"].iloc[-1]))
         k4.metric("Projected borrower XIRR", percent(borrower_xirr * 100.0))
         k5.metric("Investor target cost", percent(pnl["Weighted Investor Target (%)"]))
@@ -3267,7 +3373,7 @@ def page_modeler():
             "Arrears", "Principal_Applied", "Ending_Balance", "Property_Value", "LVR_pct", "Covenant_Breach"]
         display = schedule_df[display_cols].rename(columns={
             "Drawdown_Date": "Drawdown Date", "Payment_Date": "Payment Date",
-            "Drawdown_Gross": "Gross Drawdown", "Upfront_Fees_Deducted": "Upfront Fees Netted",
+            "Drawdown_Gross": "Borrower Cash Draw", "Upfront_Fees_Deducted": "Upfront Costs Funded",
             "Advance_Interest_Withheld": "Advance Interest Withheld",
             "Investor_Funding": "Investor Funding", "Drawdown_Net": "Net Drawdown",
             "Opening_Balance": "Opening Balance", "Balance_After_Draw": "Balance After Draw",
@@ -3432,12 +3538,15 @@ def page_modeler():
     pnl_display = pd.DataFrame(pnl_rows)
     with tabs[6]:
         st.subheader("Platform economics")
-        st.caption("Income and investor cost are modelled from the current contractual schedule. Actual receipts are shown separately in SPV Cashflows.")
+        economics_note = ("The limit applies to peak outstanding; cash-serviced interest is billed separately and may make lifetime receipts exceed the limit."
+            if interest_treatment == "Serviced" else
+            "Borrower draw, funded upfront costs, capitalised interest and scheduled charges are constrained within the facility limit.")
+        st.caption("Income, investor interest expense and funded upfront-cost expense are modelled from the current contractual schedule. " + economics_note)
         st.dataframe(pnl_display, use_container_width=True, hide_index=True)
         c1, c2, c3 = st.columns(3)
         c1.metric("Total income", money(pnl["Total Income"]))
         c2.metric("Investor interest expense", money(pnl["Investor Interest Expense"]))
-        c3.metric("Net revenue", money(pnl["Net Revenue"]))
+        c3.metric("Net revenue after upfront costs", money(pnl["Net Revenue"]))
         chart_items = ["Borrower Interest Income", "Penalty Interest Income", "Establishment Fee",
             "Legal Fee", "Risk Review Fee", "Line Fees", "Admin Fees", "Discharge Fee",
             "Other Upfront Fees", "Restructure Fee"]
@@ -3451,7 +3560,10 @@ def page_modeler():
     # ── SPV cashflows ───────────────────────────────────────────
     with tabs[7]:
         st.subheader("SPV cashflows by event date")
-        st.caption("Investor calls, repayments, distributions and other movements are recorded on their transaction dates. Forecast interest and scheduled principal remain on settlement anniversaries; logged actual movements replace the affected investor forecast.")
+        cashflow_cap_note = ("The facility limit caps peak outstanding; cash-serviced interest and fees paid over the term are outside that peak-balance test."
+            if interest_treatment == "Serviced" else
+            "The facility limit includes borrower draws, funded upfront costs, capitalised interest and scheduled charges.")
+        st.caption(cashflow_cap_note + " Investor calls, repayments, distributions and other movements are recorded on their transaction dates; forecast servicing and scheduled principal remain on settlement anniversaries.")
         cashflow_format = {column: "${:,.0f}" for column in cashflow_df.columns if column != "Date"}
         st.dataframe(cashflow_df.style.format(cashflow_format), use_container_width=True, hide_index=True, height=420)
         c1, c2 = st.columns(2)
@@ -3475,20 +3587,21 @@ def page_modeler():
         st.subheader("Fees and settlement summary")
         first_draw_rows = schedule_df[schedule_df["Drawdown_Gross"] > 0]
         first_draw = float(first_draw_rows.iloc[0]["Drawdown_Gross"]) if not first_draw_rows.empty else 0.0
+        upfront_funded_at_settlement = (min(fees["upfront_total"], first_draw)
+            if first_draw > 0 else 0.0)
         waterfall = [
-            ("First gross draw", first_draw),
-            ("Establishment fee", -fees["establishment"]),
-            ("Legal fee", -fees["legal_fee"]),
-            ("Risk review fee", -fees["risk_review"]),
-            ("Other upfront fees", -fees["other_upfront"]),
-            ("Net cash to borrower", first_draw - min(fees["upfront_total"], first_draw)),
+            ("Borrower cash draw", first_draw),
+            ("Upfront costs funded at settlement", upfront_funded_at_settlement),
+            ("Investor funding required", first_draw + upfront_funded_at_settlement),
+            ("Capacity remaining inside facility cap", max(0.0,
+                facility_amount - first_draw - upfront_funded_at_settlement)),
         ]
         left, right = st.columns([1, 1.25])
         with left:
             st.markdown("#### Settlement waterfall")
             st.dataframe(pd.DataFrame([{"Item": label, "Amount": money(amount)} for label, amount in waterfall]),
                          use_container_width=True, hide_index=True)
-            st.caption("Upfront fees are deducted from the first draw only. The discharge fee is scheduled at maturity.")
+            st.caption("Upfront costs are funded by the investor capital call and included in peak outstanding at settlement. Cash-serviced interest is paid over the term and may make lifetime borrower receipts exceed the facility limit.")
         with right:
             st.markdown("#### Fee summary")
             fee_rows = [
@@ -3496,7 +3609,7 @@ def page_modeler():
                 {"Fee": "Legal", "Amount": money(fees["legal_fee"])},
                 {"Fee": "Risk review", "Amount": money(fees["risk_review"])},
                 {"Fee": "Other upfront", "Amount": money(fees["other_upfront"])},
-                {"Fee": "Total upfront (netted from first draw)", "Amount": money(fees["upfront_total"])},
+                {"Fee": "Total upfront costs (funded by investors)", "Amount": money(fees["upfront_total"])},
                 {"Fee": "Line fee (modelled from actual undrawn balance)", "Amount": money(schedule_df["Line_Fee"].sum())},
                 {"Fee": "Admin fees", "Amount": money(schedule_df["Admin_Fee"].sum())},
                 {"Fee": "Discharge", "Amount": money(fees["discharge"])},
