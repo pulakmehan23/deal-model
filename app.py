@@ -4,6 +4,7 @@ import json
 import sqlite3
 from datetime import date, datetime, timedelta
 from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -227,17 +228,22 @@ def parse_principal_repayment_rows(raw_schedule):
 # ═══════════════════════════════════════════════════════════════
 # DATABASE
 # ═══════════════════════════════════════════════════════════════
-DB = "lms_data.db"
+# Keep the database beside this source file, independent of the process working directory.
+DB = Path(__file__).resolve().with_name("lms_data.db")
 
 
 def get_conn():
-    conn = sqlite3.connect(DB, check_same_thread=False)
+    DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB), timeout=30, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
 def init_db():
     conn = get_conn()
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = FULL")
     conn.execute("""CREATE TABLE IF NOT EXISTS borrowers (
         id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, abn TEXT, group_name TEXT,
         risk_grade TEXT DEFAULT 'Investment Grade', industry TEXT DEFAULT 'Real Estate',
@@ -292,6 +298,7 @@ def init_db():
         PRIMARY KEY (receipt_id, facility_deal_id),
         FOREIGN KEY (receipt_id) REFERENCES borrower_receipts(id) ON DELETE CASCADE,
         FOREIGN KEY (facility_deal_id) REFERENCES deals(id))""")
+
 
     deal_cols = {row[1] for row in conn.execute("PRAGMA table_info(deals)").fetchall()}
     if "facility_name" not in deal_cols:
@@ -352,6 +359,74 @@ def init_db():
         conn.execute("ALTER TABLE actuals ADD COLUMN payment_actuals_logged INTEGER DEFAULT 1")
     conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_actuals_deal_date
                     ON actuals(deal_id, actual_date) WHERE actual_date IS NOT NULL""")
+
+    # Seed one inspectable Bridging example exactly once. The marker/name lookup means
+    # restarts and repeat Streamlit reruns never duplicate it or alter existing demo rows.
+    demo_borrower_name = "DEMO ONLY — Returns & Tranches Borrower"
+    demo_deal_name = "DEMO — Bridging $10m Bullet Facility"
+    demo_settlement = date(2026, 11, 13)
+    demo_maturity = date(2027, 11, 13)
+    borrower_row = conn.execute("SELECT id FROM borrowers WHERE name=? ORDER BY id LIMIT 1",
+                                (demo_borrower_name,)).fetchone()
+    if borrower_row is None:
+        conn.execute("""INSERT INTO borrowers (name, abn, group_name, risk_grade, industry, status)
+            VALUES (?, '', 'Demo Portfolio', 'Investment Grade', 'Real Estate', 'Active')""",
+            (demo_borrower_name,))
+        borrower_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    else:
+        borrower_id = int(borrower_row[0])
+    # The exact demo name is the durable idempotency key as well as the seed_key;
+    # the workspace editor intentionally writes its canonical assumptions back and
+    # may not retain metadata fields from the initial row.
+    seeded = conn.execute(
+        "SELECT 1 FROM deals WHERE borrower_id=? AND deal_name=? AND facility_name='Tranche 1' LIMIT 1",
+        (borrower_id, demo_deal_name)).fetchone() is not None
+    if not seeded:
+        demo_params = {
+            "seed_key": "demo_bridging_10m_bullet_v1",
+            "facility_amount": 10_000_000.0, "facility_type": "Bridging",
+            "property_value": 15_000_000.0,
+            "settlement_date": demo_settlement.isoformat(),
+            "maturity_date": demo_maturity.isoformat(), "term_months": 12,
+            "loan_ranking": "Senior", "borrower_irr": 12.0, "cpr": 0.0,
+            "principal_repayment_mode": "Bullet at maturity",
+            "principal_repayment_schedule": [],
+            "interest_treatment": "Serviced", "interest_advance_months": 1,
+            "construction_months": 0, "interest_only_months": 0,
+            "drawdown_profile": "Automatic", "s_curve_steepness": 5.0,
+            "estab_fee_pct": 1.5, "line_fee_pct": 0.5,
+            "admin_fee_monthly": 500.0, "discharge_fee": 1500.0,
+            "risk_review_fee": 2500.0, "legal_fee": 3500.0,
+            "other_upfront_fees": 0.0, "restructure_fee": 0.0,
+            "pv_growth_annual": 3.0, "covenant_lvr": 75.0,
+            "default_investor_target_irr": 8.0,
+            "drawdown_schedule": json.dumps({demo_settlement.isoformat(): {
+                "gross_draw": 10_000_000.0, "allocation_source": "Standard",
+                "status": "Forecast", "allocations": {}}}),
+        }
+        conn.execute("""INSERT INTO deals (borrower_id, deal_name, facility_name, parent_deal_id,
+            facility_amount, deal_status, settlement_date, maturity_date, facility_type,
+            security_type, property_value, params_json)
+            VALUES (?, ?, 'Tranche 1', NULL, ?, 'Active', ?, ?, 'Bridging',
+                    'First Mortgage', ?, ?)""",
+            (borrower_id, demo_deal_name, 10_000_000.0, demo_settlement.isoformat(),
+             demo_maturity.isoformat(), 15_000_000.0, json.dumps(demo_params)))
+        demo_deal_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.execute("UPDATE deals SET parent_deal_id=? WHERE id=?",
+                     (demo_deal_id, demo_deal_id))
+        core_defaults = {"BPCFMC": (50.0, 80.0), "BPCFLC": (15.0, 20.0), "CBCF": (35.0, 0.0)}
+        for core_name, (senior_pct, mezz_pct) in core_defaults.items():
+            investor = conn.execute("SELECT id, target_irr, senior_target_irr, mezz_target_irr FROM investors WHERE name=?",
+                                    (core_name,)).fetchone()
+            if investor:
+                conn.execute("""INSERT OR IGNORE INTO deal_investors
+                    (deal_id, investor_id, senior_default_pct, mezz_default_pct, target_irr,
+                     senior_target_irr, mezz_target_irr, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
+                    (demo_deal_id, int(investor[0]), senior_pct, mezz_pct,
+                     float(investor[1] if investor[1] is not None else 8.0),
+                     safe_rate_pct(investor[2], 8.0), safe_rate_pct(investor[3], 8.0)))
+
     conn.commit()
     conn.close()
 
@@ -1050,7 +1125,18 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
     for name in investor_names:
         target_rates.setdefault(name, default_target_rate)
 
+    raw_interest_treatment = str(params.get("interest_treatment", "Serviced")).strip().lower()
+    investor_interest_capitalised = raw_interest_treatment in {"capitalised", "capitalized"}
+    try:
+        capitalisation_interval = int(params.get("interest_advance_months", 1))
+    except (TypeError, ValueError):
+        # "All" is a valid Serviced-interest setting; if legacy data combines it
+        # with Capitalised treatment, roll investor interest up at maturity.
+        capitalisation_interval = max(1, len(schedule_df))
+    capitalisation_interval = max(1, min(max(1, len(schedule_df)), capitalisation_interval))
+
     balances = {name: 0.0 for name in investor_names}
+    capitalised_interest_pending = {name: 0.0 for name in investor_names}
     total_funded = {name: 0.0 for name in investor_names}
     total_interest = {name: 0.0 for name in investor_names}
     total_principal_returned = {name: 0.0 for name in investor_names}
@@ -1124,6 +1210,8 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
         period_other_decrease = {name: 0.0 for name in investor_names}
         period_principal_returns = {name: 0.0 for name in investor_names}
         period_interest_actual = {name: 0.0 for name in investor_names}
+        period_interest_paid = {name: 0.0 for name in investor_names}
+        period_capitalised_interest = {name: 0.0 for name in investor_names}
         actual_interest_names = set()
         period_buyout_in = {name: 0.0 for name in investor_names}
         period_buyout_out = {name: 0.0 for name in investor_names}
@@ -1169,6 +1257,7 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
             elif tx_type == "Interest Distribution":
                 actual_interest_names.add(investor_name)
                 period_interest_actual[investor_name] += amount
+                period_interest_paid[investor_name] = period_interest_paid.get(investor_name, 0.0) + amount
                 record_flow(investor_name, tx_date, "Interest Distribution", amount, amount)
             elif tx_type == "Principal Repayment":
                 has_actual_principal = True
@@ -1217,52 +1306,86 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
         period_receipts = receipt_events_by_period.get(payment_date.isoformat(), [])
         schedule_actual_penalty = schedule_row.get("Actual_Penalty_Interest")
         if has_schedule_actual_interest:
-            # Interest earned follows each investor's ranking-specific target return. Borrower
-            # receipt components separately determine dated cash distributions to investors.
+            # Investor yield is accrued at their ranking-specific target return. In Serviced
+            # mode, cash paid is capped by borrower interest actually collected; in
+            # Capitalised mode, actual borrower interest is not passed through as cash.
             for name in list(balances):
                 interest_by_investor[name] = accrued_interest.get(name, 0.0)
-            actual_pool = max(0.0, float(schedule_actual_interest))
-            if pd.notna(schedule_actual_penalty):
-                actual_pool += max(0.0, float(schedule_actual_penalty))
-            explicit = {name: max(0.0, period_interest_actual.get(name, 0.0))
-                        for name in actual_interest_names}
-            remaining_pool = max(0.0, actual_pool - sum(explicit.values()))
-            eligible = [name for name in balances if name not in explicit]
-            weights = {name: max(0.0, accrued_interest.get(name, 0.0)) for name in eligible}
-            weight_total = sum(weights.values())
-            if weight_total <= 0:
-                weights = {name: max(0.0, balances.get(name, 0.0)) for name in eligible}
+
+            if not investor_interest_capitalised:
+                actual_pool = max(0.0, float(schedule_actual_interest))
+                if pd.notna(schedule_actual_penalty):
+                    actual_pool += max(0.0, float(schedule_actual_penalty))
+                explicit = {name: max(0.0, period_interest_actual.get(name, 0.0))
+                            for name in actual_interest_names}
+                remaining_pool = max(0.0, actual_pool - sum(explicit.values()))
+                eligible = [name for name in balances if name not in explicit]
+                weights = {name: max(0.0, accrued_interest.get(name, 0.0)) for name in eligible}
                 weight_total = sum(weights.values())
-            receipt_amounts = [max(0.0, float(row.get("interest", 0.0) or 0.0))
-                + max(0.0, float(row.get("penalty_interest", 0.0) or 0.0)) for row in period_receipts]
-            receipt_interest_total = sum(receipt_amounts)
-            receipt_pool = min(receipt_interest_total, remaining_pool)
-            manual_pool = max(0.0, remaining_pool - receipt_pool)
-            for name in eligible:
-                investor_share = weights.get(name, 0.0) / weight_total if weight_total > 0 else 0.0
-                distribution = remaining_pool * investor_share
-                if distribution <= 0:
-                    continue
-                if period_receipts and receipt_interest_total > 0 and remaining_pool > 0:
-                    for receipt_row, receipt_interest in zip(period_receipts, receipt_amounts):
-                        amount = distribution * receipt_pool / remaining_pool * receipt_interest / receipt_interest_total
-                        record_flow(name, parse_date(receipt_row.get("receipt_date"), payment_date),
-                                    "Interest Distribution", amount, amount)
-                    if manual_pool > 0:
-                        amount = distribution * manual_pool / remaining_pool
-                        record_flow(name, payment_date, "Interest Distribution", amount, amount)
-                else:
-                    record_flow(name, payment_date, "Interest Distribution", distribution, distribution)
-            # Explicit Investor Portal distributions were recorded on their transaction dates.
+                if weight_total <= 0:
+                    weights = {name: max(0.0, balances.get(name, 0.0)) for name in eligible}
+                    weight_total = sum(weights.values())
+                receipt_amounts = [max(0.0, float(row.get("interest", 0.0) or 0.0))
+                    + max(0.0, float(row.get("penalty_interest", 0.0) or 0.0)) for row in period_receipts]
+                receipt_interest_total = sum(receipt_amounts)
+                receipt_pool = min(receipt_interest_total, remaining_pool)
+                manual_pool = max(0.0, remaining_pool - receipt_pool)
+                for name in eligible:
+                    investor_share = weights.get(name, 0.0) / weight_total if weight_total > 0 else 0.0
+                    distribution = remaining_pool * investor_share
+                    if distribution <= 0:
+                        continue
+                    period_interest_paid[name] = period_interest_paid.get(name, 0.0) + distribution
+                    if period_receipts and receipt_interest_total > 0 and remaining_pool > 0:
+                        for receipt_row, receipt_interest in zip(period_receipts, receipt_amounts):
+                            amount = distribution * receipt_pool / remaining_pool * receipt_interest / receipt_interest_total
+                            record_flow(name, parse_date(receipt_row.get("receipt_date"), payment_date),
+                                        "Interest Distribution", amount, amount)
+                        if manual_pool > 0:
+                            amount = distribution * manual_pool / remaining_pool
+                            record_flow(name, payment_date, "Interest Distribution", amount, amount)
+                    else:
+                        record_flow(name, payment_date, "Interest Distribution", distribution, distribution)
+                # Explicit Investor Portal distributions were already recorded on their dates.
         else:
             for name in list(balances):
-                if name in actual_interest_names:
+                if investor_interest_capitalised:
+                    # Keep accruing the investor target return, but do not create a cash payment.
+                    interest_by_investor[name] = accrued_interest.get(name, 0.0)
+                elif name in actual_interest_names:
                     interest_by_investor[name] = period_interest_actual.get(name, 0.0)
                 else:
                     interest = accrued_interest.get(name, 0.0)
                     interest_by_investor[name] = interest
                     if interest > 0:
                         record_flow(name, payment_date, "Interest Payment", interest, interest)
+                        period_interest_paid[name] = period_interest_paid.get(name, 0.0) + interest
+
+        # Capitalised treatment carries investor accrual into their balance at the same
+        # interval selected for borrower capitalisation. No forecast cash interest is paid.
+        if investor_interest_capitalised:
+            for name in list(balances):
+                capitalised_interest_pending.setdefault(name, 0.0)
+                earned = max(0.0, float(interest_by_investor.get(name, 0.0) or 0.0))
+                paid = max(0.0, float(period_interest_paid.get(name, 0.0) or 0.0))
+                capitalised_interest_pending[name] += max(0.0, earned - paid)
+            period_payoff = any(
+                bool(row.get("is_payoff", False))
+                for row in period_receipts
+                if pd.notna(row.get("is_payoff", False))
+            )
+            capitalize_now = (
+                (period_index + 1) % capitalisation_interval == 0
+                or period_index == len(schedule_df) - 1
+                or period_payoff
+            )
+            if capitalize_now:
+                for name in list(balances):
+                    amount = max(0.0, capitalised_interest_pending.get(name, 0.0))
+                    balances[name] += amount
+                    period_capitalised_interest[name] = amount
+                    capitalised_interest_pending[name] = 0.0
+
         for name, interest in interest_by_investor.items():
             total_interest[name] = total_interest.get(name, 0.0) + interest
 
@@ -1337,6 +1460,8 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
                 "Other_Increase": period_other_increase.get(name, 0.0),
                 "Other_Decrease": period_other_decrease.get(name, 0.0),
                 "Interest_Earned": interest_by_investor.get(name, 0.0),
+                "Interest_Paid": period_interest_paid.get(name, 0.0),
+                "Capitalised_Interest": period_capitalised_interest.get(name, 0.0),
                 "Principal_Returned": returned,
                 "Buyout_In": period_buyout_in.get(name, 0.0),
                 "Buyout_Out": period_buyout_out.get(name, 0.0),
@@ -1346,8 +1471,9 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
             })
 
     ledger_columns = ["Drawdown_Date", "Payment_Date", "Investor", "Capital_Called", "Other_Increase",
-        "Other_Decrease", "Interest_Earned", "Principal_Returned", "Buyout_In", "Buyout_Out",
-        "Ending_Balance", "Cumulative_Funded", "Cumulative_Interest"]
+        "Other_Decrease", "Interest_Earned", "Interest_Paid", "Capitalised_Interest",
+        "Principal_Returned", "Buyout_In", "Buyout_Out", "Ending_Balance",
+        "Cumulative_Funded", "Cumulative_Interest"]
     ledger_df = pd.DataFrame(rows, columns=ledger_columns)
     summary_rows = []
     for name in investor_names:
@@ -1497,7 +1623,7 @@ def build_cashflows(schedule_df, investor_ledger_df, fees, investor_cashflows=No
             draw_event = bucket(row["Drawdown_Date"])
             draw_event["Investor_Capital_Called"] += float(row["Capital_Called"])
             payment_event = bucket(row["Payment_Date"])
-            payment_event["Investor_Interest_Paid"] += float(row["Interest_Earned"])
+            payment_event["Investor_Interest_Paid"] += float(row.get("Interest_Paid", 0.0) or 0.0)
             payment_event["Investor_Principal_Returned"] += float(row["Principal_Returned"])
             draw_event["Investor_Other_Increase"] += float(row.get("Other_Increase", 0.0))
             payment_event["Investor_Other_Decrease"] += float(row.get("Other_Decrease", 0.0))
@@ -2508,7 +2634,7 @@ def page_modeler():
     st.caption(f"Tranche ID {deal_id}  |  Ranking: {loan_ranking_default}  |  Status: {deal_row['deal_status']}  |  Security: {deal_row['security_type']}")
     if legacy_facility_type_unknown and not legacy_mezzanine_type:
         st.warning(f"Legacy facility type ‘{facility_type_raw}’ is no longer available. This deal is being treated as Bridging; choose Construction or Residual Stock if that is more appropriate, then save.")
-    st.markdown('<div class="section-note">Edit assumptions or drawdowns once. All schedules, investor allocations, economics and cashflows below recalculate from the current inputs. Save changes from the Overview tab to persist them.</div>',
+    st.markdown('<div class="section-note">Edit assumptions or drawdowns once. Schedules, investor allocations, economics and cashflows recalculate from the current inputs; workspace changes autosave to the persistent database.</div>',
                 unsafe_allow_html=True)
 
     tabs = st.tabs(["Overview", "Setup & Terms", "Drawdown Plan", "Loan Schedule",
@@ -2911,6 +3037,8 @@ def page_modeler():
         "restructure_fee": float(restructure_fee), "pv_growth_annual": float(pv_growth_annual),
         "covenant_lvr": float(covenant_lvr), "penalty_rate": float(penalty_rate),
     }
+    if existing_params.get("seed_key"):
+        params["seed_key"] = existing_params["seed_key"]
 
     # ── Editable drawdown and investor allocation matrix ─────────
     signature = drawdown_signature(deal_id, facility_amount, facility_type, settlement,
@@ -3014,6 +3142,16 @@ def page_modeler():
     params["drawdown_schedule"] = json.dumps(drawdown_map)
     params["drawdown_signature"] = signature
 
+    # Persist current workspace inputs on every run, but only write when values changed.
+    # This protects edits made on any tab from being lost on a session/app restart.
+    params_changed = (json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
+        != json.dumps(existing_params, sort_keys=True, separators=(",", ":"), default=str))
+    if params_changed:
+        update_deal_model(deal_id, params)
+        workspace_saved_now = True
+    else:
+        workspace_saved_now = False
+
     # Build actuals and all model outputs from the current inputs and edited grid.
     actuals_df = load_actuals(deal_id)
     receipt_allocations_df = load_receipt_allocations(facility_deal_id=deal_id)
@@ -3026,10 +3164,15 @@ def page_modeler():
     cashflow_df = build_cashflows(schedule_df, investor_ledger_df, fees,
                                   investor_cashflows, receipt_allocations_df)
 
+    if workspace_saved_now:
+        st.success(f"Workspace changes saved to {DB.name}.")
+    else:
+        st.caption(f"All workspace assumptions and drawdown edits are saved in {DB.name}.")
+
     # ── Overview ────────────────────────────────────────────────
     with tabs[0]:
         st.subheader("Live deal overview")
-        st.caption("All figures below use the current on-screen assumptions and drawdown plan. Click Save all changes to persist them to the deal record.")
+        st.caption("All figures below use the current on-screen assumptions and drawdown plan. Changes autosave; the button below can also be used to force a save.")
         k1, k2, k3, k4, k5, k6 = st.columns(6)
         k1.metric("Tranche Amount", money(facility_amount))
         k2.metric("Gross drawn", money(schedule_df["Drawdown_Gross"].sum()))
@@ -3042,11 +3185,11 @@ def page_modeler():
         d1.metric("Settlement", settlement.strftime("%d %b %Y"))
         d2.metric("Next anniversary", schedule_df["Payment_Date"].iloc[0].strftime("%d %b %Y"))
         d3.metric("Maturity anniversary", maturity_date.strftime("%d %b %Y"))
-        st.markdown("#### Save current deal setup")
-        st.caption("This saves terms, dates, fees, investor assumptions and the edited drawdown schedule to the selected deal.")
-        if st.button("Save all changes", type="primary", key=prefix + "save_all_changes"):
+        st.markdown("#### Persistence status")
+        st.caption("Terms, dates, fees, investor assumptions and the edited drawdown schedule autosave to SQLite. Use this button to force a save if needed.")
+        if st.button("Save all changes now", type="primary", key=prefix + "save_all_changes"):
             update_deal_model(deal_id, params)
-            st.success("Deal assumptions saved; Actual drawdown allocations have been synced to the Investor Portal.")
+            st.success("Deal assumptions saved; actual drawdown allocations have been synced to the Investor Portal.")
 
         due_breaches = schedule_df[schedule_df["Covenant_Breach"]]
         if not due_breaches.empty:
@@ -3215,7 +3358,7 @@ def page_modeler():
     with tabs[5]:
         st.subheader("Investor base and returns")
         st.caption(f"Investor target returns are individual; the {loan_ranking} return is applied for this tranche. See Setup & Terms → Returns & Allocation for each investor’s rate and the alternate-ranking default.")
-        st.info("Standard rows use the tranche ranking: Senior 50% / 15% / 35% (BPCFMC / BPCFLC / CBCF), or Mezzanine 80% / 20% (BPCFMC / BPCFLC). Investor Ledger and Manual rows use their recorded/entered splits. Buyouts and actual repayments are applied from Investor Portal transactions.")
+        st.info("Standard rows use the tranche ranking: Senior 50% / 15% / 35% (BPCFMC / BPCFLC / CBCF), or Mezzanine 80% / 20% (BPCFMC / BPCFLC). Investor Ledger and Manual rows use their recorded/entered splits. In Serviced mode, projected investor interest is paid only when borrower servicing is projected; actual-period payments are limited to borrower interest actually collected. In Capitalised mode, investor interest is added to investor balances at the selected capitalisation interval, with no forecast cash interest paid. Buyouts and actual repayments are applied from Investor Portal transactions.")
         summary_format = {"Total_Funded": "${:,.0f}", "Total_Interest_Earned": "${:,.0f}",
             "Total_Principal_Returned": "${:,.0f}", "Outstanding_Balance": "${:,.0f}",
             "Target_XIRR": "{:.2f}%", "Actual_XIRR": "{:.2f}%"}
@@ -3236,6 +3379,7 @@ def page_modeler():
         filtered_ledger = investor_ledger_df[investor_ledger_df["Investor"].isin(selected_investors)].copy()
         ledger_format = {"Capital_Called": "${:,.0f}", "Other_Increase": "${:,.0f}",
             "Other_Decrease": "${:,.0f}", "Interest_Earned": "${:,.0f}",
+            "Interest_Paid": "${:,.0f}", "Capitalised_Interest": "${:,.0f}",
             "Principal_Returned": "${:,.0f}", "Buyout_In": "${:,.0f}", "Buyout_Out": "${:,.0f}",
             "Ending_Balance": "${:,.0f}",
             "Cumulative_Funded": "${:,.0f}", "Cumulative_Interest": "${:,.0f}"}
