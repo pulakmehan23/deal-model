@@ -1125,7 +1125,18 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
     for name in investor_names:
         target_rates.setdefault(name, default_target_rate)
 
+    raw_interest_treatment = str(params.get("interest_treatment", "Serviced")).strip().lower()
+    investor_interest_capitalised = raw_interest_treatment in {"capitalised", "capitalized"}
+    try:
+        capitalisation_interval = int(params.get("interest_advance_months", 1))
+    except (TypeError, ValueError):
+        # "All" is a valid Serviced-interest setting; if legacy data combines it
+        # with Capitalised treatment, roll investor interest up at maturity.
+        capitalisation_interval = max(1, len(schedule_df))
+    capitalisation_interval = max(1, min(max(1, len(schedule_df)), capitalisation_interval))
+
     balances = {name: 0.0 for name in investor_names}
+    capitalised_interest_pending = {name: 0.0 for name in investor_names}
     total_funded = {name: 0.0 for name in investor_names}
     total_interest = {name: 0.0 for name in investor_names}
     total_principal_returned = {name: 0.0 for name in investor_names}
@@ -1199,6 +1210,8 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
         period_other_decrease = {name: 0.0 for name in investor_names}
         period_principal_returns = {name: 0.0 for name in investor_names}
         period_interest_actual = {name: 0.0 for name in investor_names}
+        period_interest_paid = {name: 0.0 for name in investor_names}
+        period_capitalised_interest = {name: 0.0 for name in investor_names}
         actual_interest_names = set()
         period_buyout_in = {name: 0.0 for name in investor_names}
         period_buyout_out = {name: 0.0 for name in investor_names}
@@ -1244,6 +1257,7 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
             elif tx_type == "Interest Distribution":
                 actual_interest_names.add(investor_name)
                 period_interest_actual[investor_name] += amount
+                period_interest_paid[investor_name] = period_interest_paid.get(investor_name, 0.0) + amount
                 record_flow(investor_name, tx_date, "Interest Distribution", amount, amount)
             elif tx_type == "Principal Repayment":
                 has_actual_principal = True
@@ -1292,52 +1306,86 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
         period_receipts = receipt_events_by_period.get(payment_date.isoformat(), [])
         schedule_actual_penalty = schedule_row.get("Actual_Penalty_Interest")
         if has_schedule_actual_interest:
-            # Interest earned follows each investor's ranking-specific target return. Borrower
-            # receipt components separately determine dated cash distributions to investors.
+            # Investor yield is accrued at their ranking-specific target return. In Serviced
+            # mode, cash paid is capped by borrower interest actually collected; in
+            # Capitalised mode, actual borrower interest is not passed through as cash.
             for name in list(balances):
                 interest_by_investor[name] = accrued_interest.get(name, 0.0)
-            actual_pool = max(0.0, float(schedule_actual_interest))
-            if pd.notna(schedule_actual_penalty):
-                actual_pool += max(0.0, float(schedule_actual_penalty))
-            explicit = {name: max(0.0, period_interest_actual.get(name, 0.0))
-                        for name in actual_interest_names}
-            remaining_pool = max(0.0, actual_pool - sum(explicit.values()))
-            eligible = [name for name in balances if name not in explicit]
-            weights = {name: max(0.0, accrued_interest.get(name, 0.0)) for name in eligible}
-            weight_total = sum(weights.values())
-            if weight_total <= 0:
-                weights = {name: max(0.0, balances.get(name, 0.0)) for name in eligible}
+
+            if not investor_interest_capitalised:
+                actual_pool = max(0.0, float(schedule_actual_interest))
+                if pd.notna(schedule_actual_penalty):
+                    actual_pool += max(0.0, float(schedule_actual_penalty))
+                explicit = {name: max(0.0, period_interest_actual.get(name, 0.0))
+                            for name in actual_interest_names}
+                remaining_pool = max(0.0, actual_pool - sum(explicit.values()))
+                eligible = [name for name in balances if name not in explicit]
+                weights = {name: max(0.0, accrued_interest.get(name, 0.0)) for name in eligible}
                 weight_total = sum(weights.values())
-            receipt_amounts = [max(0.0, float(row.get("interest", 0.0) or 0.0))
-                + max(0.0, float(row.get("penalty_interest", 0.0) or 0.0)) for row in period_receipts]
-            receipt_interest_total = sum(receipt_amounts)
-            receipt_pool = min(receipt_interest_total, remaining_pool)
-            manual_pool = max(0.0, remaining_pool - receipt_pool)
-            for name in eligible:
-                investor_share = weights.get(name, 0.0) / weight_total if weight_total > 0 else 0.0
-                distribution = remaining_pool * investor_share
-                if distribution <= 0:
-                    continue
-                if period_receipts and receipt_interest_total > 0 and remaining_pool > 0:
-                    for receipt_row, receipt_interest in zip(period_receipts, receipt_amounts):
-                        amount = distribution * receipt_pool / remaining_pool * receipt_interest / receipt_interest_total
-                        record_flow(name, parse_date(receipt_row.get("receipt_date"), payment_date),
-                                    "Interest Distribution", amount, amount)
-                    if manual_pool > 0:
-                        amount = distribution * manual_pool / remaining_pool
-                        record_flow(name, payment_date, "Interest Distribution", amount, amount)
-                else:
-                    record_flow(name, payment_date, "Interest Distribution", distribution, distribution)
-            # Explicit Investor Portal distributions were recorded on their transaction dates.
+                if weight_total <= 0:
+                    weights = {name: max(0.0, balances.get(name, 0.0)) for name in eligible}
+                    weight_total = sum(weights.values())
+                receipt_amounts = [max(0.0, float(row.get("interest", 0.0) or 0.0))
+                    + max(0.0, float(row.get("penalty_interest", 0.0) or 0.0)) for row in period_receipts]
+                receipt_interest_total = sum(receipt_amounts)
+                receipt_pool = min(receipt_interest_total, remaining_pool)
+                manual_pool = max(0.0, remaining_pool - receipt_pool)
+                for name in eligible:
+                    investor_share = weights.get(name, 0.0) / weight_total if weight_total > 0 else 0.0
+                    distribution = remaining_pool * investor_share
+                    if distribution <= 0:
+                        continue
+                    period_interest_paid[name] = period_interest_paid.get(name, 0.0) + distribution
+                    if period_receipts and receipt_interest_total > 0 and remaining_pool > 0:
+                        for receipt_row, receipt_interest in zip(period_receipts, receipt_amounts):
+                            amount = distribution * receipt_pool / remaining_pool * receipt_interest / receipt_interest_total
+                            record_flow(name, parse_date(receipt_row.get("receipt_date"), payment_date),
+                                        "Interest Distribution", amount, amount)
+                        if manual_pool > 0:
+                            amount = distribution * manual_pool / remaining_pool
+                            record_flow(name, payment_date, "Interest Distribution", amount, amount)
+                    else:
+                        record_flow(name, payment_date, "Interest Distribution", distribution, distribution)
+                # Explicit Investor Portal distributions were already recorded on their dates.
         else:
             for name in list(balances):
-                if name in actual_interest_names:
+                if investor_interest_capitalised:
+                    # Keep accruing the investor target return, but do not create a cash payment.
+                    interest_by_investor[name] = accrued_interest.get(name, 0.0)
+                elif name in actual_interest_names:
                     interest_by_investor[name] = period_interest_actual.get(name, 0.0)
                 else:
                     interest = accrued_interest.get(name, 0.0)
                     interest_by_investor[name] = interest
                     if interest > 0:
                         record_flow(name, payment_date, "Interest Payment", interest, interest)
+                        period_interest_paid[name] = period_interest_paid.get(name, 0.0) + interest
+
+        # Capitalised treatment carries investor accrual into their balance at the same
+        # interval selected for borrower capitalisation. No forecast cash interest is paid.
+        if investor_interest_capitalised:
+            for name in list(balances):
+                capitalised_interest_pending.setdefault(name, 0.0)
+                earned = max(0.0, float(interest_by_investor.get(name, 0.0) or 0.0))
+                paid = max(0.0, float(period_interest_paid.get(name, 0.0) or 0.0))
+                capitalised_interest_pending[name] += max(0.0, earned - paid)
+            period_payoff = any(
+                bool(row.get("is_payoff", False))
+                for row in period_receipts
+                if pd.notna(row.get("is_payoff", False))
+            )
+            capitalize_now = (
+                (period_index + 1) % capitalisation_interval == 0
+                or period_index == len(schedule_df) - 1
+                or period_payoff
+            )
+            if capitalize_now:
+                for name in list(balances):
+                    amount = max(0.0, capitalised_interest_pending.get(name, 0.0))
+                    balances[name] += amount
+                    period_capitalised_interest[name] = amount
+                    capitalised_interest_pending[name] = 0.0
+
         for name, interest in interest_by_investor.items():
             total_interest[name] = total_interest.get(name, 0.0) + interest
 
@@ -1412,6 +1460,8 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
                 "Other_Increase": period_other_increase.get(name, 0.0),
                 "Other_Decrease": period_other_decrease.get(name, 0.0),
                 "Interest_Earned": interest_by_investor.get(name, 0.0),
+                "Interest_Paid": period_interest_paid.get(name, 0.0),
+                "Capitalised_Interest": period_capitalised_interest.get(name, 0.0),
                 "Principal_Returned": returned,
                 "Buyout_In": period_buyout_in.get(name, 0.0),
                 "Buyout_Out": period_buyout_out.get(name, 0.0),
@@ -1421,8 +1471,9 @@ def build_investor_ledger(schedule_df, params, investors_df, transactions_df=Non
             })
 
     ledger_columns = ["Drawdown_Date", "Payment_Date", "Investor", "Capital_Called", "Other_Increase",
-        "Other_Decrease", "Interest_Earned", "Principal_Returned", "Buyout_In", "Buyout_Out",
-        "Ending_Balance", "Cumulative_Funded", "Cumulative_Interest"]
+        "Other_Decrease", "Interest_Earned", "Interest_Paid", "Capitalised_Interest",
+        "Principal_Returned", "Buyout_In", "Buyout_Out", "Ending_Balance",
+        "Cumulative_Funded", "Cumulative_Interest"]
     ledger_df = pd.DataFrame(rows, columns=ledger_columns)
     summary_rows = []
     for name in investor_names:
@@ -1572,7 +1623,7 @@ def build_cashflows(schedule_df, investor_ledger_df, fees, investor_cashflows=No
             draw_event = bucket(row["Drawdown_Date"])
             draw_event["Investor_Capital_Called"] += float(row["Capital_Called"])
             payment_event = bucket(row["Payment_Date"])
-            payment_event["Investor_Interest_Paid"] += float(row["Interest_Earned"])
+            payment_event["Investor_Interest_Paid"] += float(row.get("Interest_Paid", 0.0) or 0.0)
             payment_event["Investor_Principal_Returned"] += float(row["Principal_Returned"])
             draw_event["Investor_Other_Increase"] += float(row.get("Other_Increase", 0.0))
             payment_event["Investor_Other_Decrease"] += float(row.get("Other_Decrease", 0.0))
@@ -3307,7 +3358,7 @@ def page_modeler():
     with tabs[5]:
         st.subheader("Investor base and returns")
         st.caption(f"Investor target returns are individual; the {loan_ranking} return is applied for this tranche. See Setup & Terms → Returns & Allocation for each investor’s rate and the alternate-ranking default.")
-        st.info("Standard rows use the tranche ranking: Senior 50% / 15% / 35% (BPCFMC / BPCFLC / CBCF), or Mezzanine 80% / 20% (BPCFMC / BPCFLC). Investor Ledger and Manual rows use their recorded/entered splits. Buyouts and actual repayments are applied from Investor Portal transactions.")
+        st.info("Standard rows use the tranche ranking: Senior 50% / 15% / 35% (BPCFMC / BPCFLC / CBCF), or Mezzanine 80% / 20% (BPCFMC / BPCFLC). Investor Ledger and Manual rows use their recorded/entered splits. In Serviced mode, projected investor interest is paid only when borrower servicing is projected; actual-period payments are limited to borrower interest actually collected. In Capitalised mode, investor interest is added to investor balances at the selected capitalisation interval, with no forecast cash interest paid. Buyouts and actual repayments are applied from Investor Portal transactions.")
         summary_format = {"Total_Funded": "${:,.0f}", "Total_Interest_Earned": "${:,.0f}",
             "Total_Principal_Returned": "${:,.0f}", "Outstanding_Balance": "${:,.0f}",
             "Target_XIRR": "{:.2f}%", "Actual_XIRR": "{:.2f}%"}
@@ -3328,6 +3379,7 @@ def page_modeler():
         filtered_ledger = investor_ledger_df[investor_ledger_df["Investor"].isin(selected_investors)].copy()
         ledger_format = {"Capital_Called": "${:,.0f}", "Other_Increase": "${:,.0f}",
             "Other_Decrease": "${:,.0f}", "Interest_Earned": "${:,.0f}",
+            "Interest_Paid": "${:,.0f}", "Capitalised_Interest": "${:,.0f}",
             "Principal_Returned": "${:,.0f}", "Buyout_In": "${:,.0f}", "Buyout_Out": "${:,.0f}",
             "Ending_Balance": "${:,.0f}",
             "Cumulative_Funded": "${:,.0f}", "Cumulative_Interest": "${:,.0f}"}
