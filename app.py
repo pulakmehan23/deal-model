@@ -3160,6 +3160,16 @@ def page_modeler():
                 if investor_name not in investor_names:
                     investor_names.append(investor_name)
     upfront_total = compute_fees(params)["upfront_total"]
+    # The seed's suggested Capitalised draw deliberately retains 8% of the limit
+    # for interest/charges; Serviced can draw the rest because cash interest does not
+    # increase peak outstanding. Apply this to Reset-to-suggested as well as first seed.
+    if existing_params.get("seed_key") == "demo_bridging_10m_bullet_v1":
+        target_suggested_draw = (max(0.0, float(facility_amount) - upfront_total)
+            if interest_treatment == "Serviced" else
+            max(0.0, float(facility_amount) - upfront_total - 0.08 * float(facility_amount)))
+        template_total = float(template["Drawdown Amount"].sum()) if not template.empty else 0.0
+        if template_total > 0:
+            template["Drawdown Amount"] = template["Drawdown Amount"] * (target_suggested_draw / template_total)
     drawdown_plan_source = existing_params.get("drawdown_schedule", {})
     # The seeded $10m illustration sizes its settlement draw according to treatment:
     # reserve 8% of the cap when interest capitalises; when serviced, cash interest
@@ -3193,6 +3203,35 @@ def page_modeler():
                 nonzero_rows[0][1]["gross_draw"] = target_draw
                 plan_to_resize[nonzero_rows[0][0]] = nonzero_rows[0][1]
                 drawdown_plan_source = json.dumps(plan_to_resize)
+    # Repair a legacy seeded forecast that drew almost the entire cap before the
+    # capped-interest reserve was introduced. Do not alter actual or manual rows.
+    if (existing_params.get("seed_key") == "demo_bridging_10m_bullet_v1"
+            and current_treatment in ["Capitalised", "Capitalized", "Serviced"]):
+        legacy_plan = safe_json(drawdown_plan_source, {})
+        if isinstance(legacy_plan, dict):
+            nonzero_rows = []
+            for date_key, plan_item in legacy_plan.items():
+                item = plan_item if isinstance(plan_item, dict) else {"gross_draw": plan_item}
+                amount = max(0.0, float(item.get("gross_draw", item.get("amount", 0.0)) or 0.0))
+                if amount > 0.01:
+                    nonzero_rows.append((date_key, item, amount))
+            cap_fees = compute_fees(params)
+            old_full_limit_draw = float(facility_amount)
+            old_fee_clamped_draw = max(0.0, float(facility_amount)
+                - cap_fees["admin_total_estimate"] - cap_fees["line_fee_estimate"] - cap_fees["discharge"])
+            legacy_amounts = [old_full_limit_draw, old_fee_clamped_draw]
+            is_legacy_full_cap_draw = (len(nonzero_rows) == 1 and any(
+                abs(nonzero_rows[0][2] - expected) <= 0.01 for expected in legacy_amounts))
+            is_default_forecast = (is_legacy_full_cap_draw
+                and str(nonzero_rows[0][1].get("allocation_source", "Standard")) == "Standard"
+                and str(nonzero_rows[0][1].get("status", "Forecast")) == "Forecast")
+            if is_default_forecast:
+                corrected_draw = (max(0.0, float(facility_amount) - upfront_total)
+                    if current_treatment == "Serviced" else
+                    max(0.0, float(facility_amount) - upfront_total - 0.08 * float(facility_amount)))
+                nonzero_rows[0][1]["gross_draw"] = corrected_draw
+                legacy_plan[nonzero_rows[0][0]] = nonzero_rows[0][1]
+                drawdown_plan_source = json.dumps(legacy_plan)
     force_template_key = prefix + "force_drawdown_template"
     reset_count_key = prefix + "drawdown_reset_count"
     init_widget_state(force_template_key, False)
