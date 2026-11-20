@@ -710,6 +710,54 @@ def compute_fees(params):
     }
 
 
+def max_bullet_draw_with_full_capitalised_interest(params):
+    """Back-solve a single settlement draw so full-term capitalised interest fits the cap.
+
+    The seeded Bridging example is a bullet loan. This solves the maximum borrower
+    draw under the worst-case no-interim-principal-repayment path, including funded
+    upfront fees and the configured ACT/365 capitalisation interval. Cash-billed
+    admin, line and discharge fees do not consume peak outstanding capacity.
+    """
+    treatment = str(params.get("interest_treatment", "Capitalised")).strip().lower()
+    if treatment not in {"capitalised", "capitalized"}:
+        return None
+    facility_amount = max(0.0, float(params.get("facility_amount", 0.0) or 0.0))
+    if facility_amount <= 0:
+        return 0.0
+    term = max(1, int(params.get("term_months", 12)))
+    settlement = parse_date(params.get("settlement_date"), date.today())
+    annual_rate = float(params.get("borrower_irr", 12.0)) / 100.0
+    raw_interval = params.get("interest_advance_months", 1)
+    try:
+        interval = (term if str(raw_interval).strip().lower() == "all"
+                    else max(1, min(term, int(raw_interval))))
+    except (TypeError, ValueError):
+        interval = 1
+
+    # Grow a unit of starting balance using the exact dates/rate/capitalisation timing.
+    balance_factor = 1.0
+    pending_interest_factor = 0.0
+    for index in range(term):
+        start = add_months(settlement, index)
+        end = add_months(settlement, index + 1)
+        days = max((end - start).days, 1)
+        pending_interest_factor += balance_factor * annual_rate_for_days(annual_rate, days)
+        capitalize_now = ((index + 1) % interval == 0 or index == term - 1)
+        if capitalize_now:
+            balance_factor += pending_interest_factor
+            pending_interest_factor = 0.0
+
+    upfront = max(0.0, float(compute_fees(params)["upfront_total"]))
+    max_initial_outstanding = facility_amount / max(balance_factor, 1e-12)
+    # Upfront costs are funded from investor proceeds and added to opening principal.
+    if max_initial_outstanding >= 2.0 * upfront:
+        borrower_draw = max_initial_outstanding - upfront
+    else:
+        borrower_draw = max_initial_outstanding / 2.0
+    # Keep a one-cent tolerance below the exact boundary to avoid float-rounding warnings.
+    return max(0.0, min(facility_amount, borrower_draw - 0.01))
+
+
 def read_drawdown_map(params):
     raw = safe_json(params.get("drawdown_schedule", {}), {})
     result = {}
@@ -755,10 +803,9 @@ def build_schedule(params, actuals_map, drawdown_map):
     fees = compute_fees(params)
     raw_interest_treatment = str(params.get("interest_treatment", "Serviced")).strip().lower()
     interest_treatment = "Capitalised" if raw_interest_treatment in ["capitalised", "capitalized"] else "Serviced"
-    # Only capitalised fees/interest consume the peak-balance cap. For the
-    # Capitalised scenario, reserve scheduled charges before allocating interest capacity.
-    projected_fee_cap_reserve = ((fees["admin_total_estimate"] + fees["line_fee_estimate"]
-        + fees["discharge"]) if interest_treatment == "Capitalised" else 0.0)
+    # The cap is a peak-outstanding test: borrower draws, funded upfront costs and
+    # capitalised interest count. Admin, line and discharge fees are billed in cash
+    # and are not added to principal, so they must not consume outstanding capacity.
     advance_setting = params.get("interest_advance_months", 1)
     all_interest_in_advance = str(advance_setting).strip().lower() == "all"
     try:
@@ -786,7 +833,6 @@ def build_schedule(params, actuals_map, drawdown_map):
     balance = 0.0
     cumulative_drawn = 0.0
     cumulative_upfront_funded = 0.0
-    cumulative_cap_fee_charges = 0.0
     cumulative_interest_charged = 0.0
     cumulative_borrower_principal_repaid = 0.0
     cumulative_upfront_fees_repaid = 0.0
@@ -844,9 +890,8 @@ def build_schedule(params, actuals_map, drawdown_map):
             # Cash-serviced interest and cash-billed fees do not enlarge peak outstanding.
             cap_room_before_draw = max(0.0, facility_amount - opening_balance)
         else:
-            fees_reserved_for_draw = max(projected_fee_cap_reserve, cumulative_cap_fee_charges)
             cap_room_before_draw = max(0.0, facility_amount - cumulative_drawn
-                - cumulative_upfront_funded - fees_reserved_for_draw - cumulative_interest_charged)
+                - cumulative_upfront_funded - cumulative_interest_charged)
         if not actual_draw_override:
             gross_draw = min(gross_draw, cap_room_before_draw)
         upfront_deducted = 0.0
@@ -856,8 +901,7 @@ def build_schedule(params, actuals_map, drawdown_map):
                 upfront_room = max(0.0, facility_amount - opening_balance - gross_draw)
             else:
                 upfront_room = max(0.0, facility_amount - cumulative_drawn - gross_draw
-                    - cumulative_upfront_funded - max(projected_fee_cap_reserve, cumulative_cap_fee_charges)
-                    - cumulative_interest_charged)
+                    - cumulative_upfront_funded - cumulative_interest_charged)
             upfront_deducted = min(fees["upfront_total"], upfront_room)
             first_draw_done = True
         investor_funding = max(0.0, gross_draw + upfront_deducted)
@@ -868,17 +912,16 @@ def build_schedule(params, actuals_map, drawdown_map):
         cumulative_drawn += gross_draw
         cumulative_upfront_funded += upfront_deducted
 
-        # Capitalised-treatment fees consume capacity inside the peak/outstanding cap.
+        # These scheduled fees are billed in cash and are not added to principal.
         arrears_opening = arrears
         in_construction = facility_type == "Construction" and index < construction_months
         in_interest_only = index < interest_only_months
         undrawn = max(0.0, facility_amount - cumulative_drawn - cumulative_upfront_funded
-            - cumulative_cap_fee_charges - cumulative_interest_charged)
+            - cumulative_interest_charged)
         line_fee = (undrawn * fees["line_fee_rate"] * (days / 365.0)
                     if in_construction and not after_payoff else 0.0)
         admin_fee = fees["admin_monthly"] if not after_payoff else 0.0
         discharge_fee = fees["discharge"] if index == term - 1 and not after_payoff else 0.0
-        current_cap_fee_charges = line_fee + admin_fee + discharge_fee
 
         if after_payoff:
             interest_accrued = 0.0
@@ -900,10 +943,8 @@ def build_schedule(params, actuals_map, drawdown_map):
         gross_interest_accrued = max(0.0, float(interest_accrued))
         interest_cap_shortfall = 0.0
         if interest_treatment == "Capitalised" and not bool(actual.get("payment_actuals_logged", False)):
-            fees_reserved_within_cap = max(projected_fee_cap_reserve,
-                cumulative_cap_fee_charges + current_cap_fee_charges)
             available_for_interest = max(0.0, facility_amount - cumulative_drawn
-                - cumulative_upfront_funded - fees_reserved_within_cap - cumulative_interest_charged)
+                - cumulative_upfront_funded - cumulative_interest_charged)
             interest_accrued = min(interest_accrued, available_for_interest)
             interest_cap_shortfall = max(0.0, gross_interest_accrued - interest_accrued)
         if after_payoff or interest_treatment == "Capitalised":
@@ -916,7 +957,6 @@ def build_schedule(params, actuals_map, drawdown_map):
             interest_due = interest_accrued
         if interest_treatment == "Capitalised":
             cumulative_interest_charged += interest_accrued
-        cumulative_cap_fee_charges += current_cap_fee_charges
         if interest_treatment == "Capitalised":
             capitalised_interest_pending += interest_accrued
             capitalize_now = ((index + 1) % capitalisation_interval == 0
@@ -3160,24 +3200,24 @@ def page_modeler():
                 if investor_name not in investor_names:
                     investor_names.append(investor_name)
     upfront_total = compute_fees(params)["upfront_total"]
-    # The seed's suggested Capitalised draw deliberately retains 8% of the limit
-    # for interest/charges; Serviced can draw the rest because cash interest does not
-    # increase peak outstanding. Apply this to Reset-to-suggested as well as first seed.
+    # The seeded bullet example back-solves its suggested Capitalised draw so the
+    # entire forecast interest path fits inside peak outstanding. Serviced can draw
+    # the limit less funded upfront costs because cash interest is paid outside the cap.
     if existing_params.get("seed_key") == "demo_bridging_10m_bullet_v1":
+        cap_fit_draw = max_bullet_draw_with_full_capitalised_interest(params)
         target_suggested_draw = (max(0.0, float(facility_amount) - upfront_total)
             if interest_treatment == "Serviced" else
-            max(0.0, float(facility_amount) - upfront_total - 0.08 * float(facility_amount)))
+            (cap_fit_draw if cap_fit_draw is not None else
+             max(0.0, float(facility_amount) - upfront_total - 0.08 * float(facility_amount))))
         template_total = float(template["Drawdown Amount"].sum()) if not template.empty else 0.0
         if template_total > 0:
             template["Drawdown Amount"] = template["Drawdown Amount"] * (target_suggested_draw / template_total)
     drawdown_plan_source = existing_params.get("drawdown_schedule", {})
-    # The seeded $10m illustration sizes its settlement draw according to treatment:
-    # reserve 8% of the cap when interest capitalises; when serviced, cash interest
-    # does not consume peak outstanding capacity, so the undrawn capacity can be drawn.
+    # If the seeded one-draw forecast is still untouched, keep it cap-fitted as
+    # rate, term, fees or treatment change. User-edited/manual/actual plans stay put.
     previous_treatment = str(existing_params.get("interest_treatment", "Capitalised"))
     current_treatment = str(interest_treatment)
-    if (existing_params.get("seed_key") == "demo_bridging_10m_bullet_v1"
-            and previous_treatment != current_treatment):
+    if existing_params.get("seed_key") == "demo_bridging_10m_bullet_v1":
         plan_to_resize = safe_json(drawdown_plan_source, {})
         if isinstance(plan_to_resize, dict):
             nonzero_rows = []
@@ -3191,15 +3231,21 @@ def page_modeler():
             previous_upfront = compute_fees(old_params)["upfront_total"]
             previous_mode = ("Capitalised" if previous_treatment.strip().lower() in
                              ["capitalised", "capitalized"] else "Serviced")
+            old_cap_fit_draw = max_bullet_draw_with_full_capitalised_interest(old_params)
             expected_previous_draw = (max(0.0, old_limit - previous_upfront)
-                if previous_mode == "Serviced" else max(0.0, old_limit - previous_upfront - 0.08 * old_limit))
-            if (len(nonzero_rows) == 1
-                    and abs(nonzero_rows[0][2] - expected_previous_draw) <= 0.01
-                    and str(nonzero_rows[0][1].get("allocation_source", "Standard")) == "Standard"
-                    and str(nonzero_rows[0][1].get("status", "Forecast")) == "Forecast"):
-                target_draw = (max(0.0, float(facility_amount) - upfront_total)
-                    if current_treatment == "Serviced" else
-                    max(0.0, float(facility_amount) - upfront_total - 0.08 * float(facility_amount)))
+                if previous_mode == "Serviced" else
+                (old_cap_fit_draw if old_cap_fit_draw is not None else
+                 max(0.0, old_limit - previous_upfront - 0.08 * old_limit)))
+            current_cap_fit_draw = max_bullet_draw_with_full_capitalised_interest(params)
+            target_draw = (max(0.0, float(facility_amount) - upfront_total)
+                if current_treatment == "Serviced" else
+                (current_cap_fit_draw if current_cap_fit_draw is not None else
+                 max(0.0, float(facility_amount) - upfront_total - 0.08 * float(facility_amount))))
+            untouched_default = (len(nonzero_rows) == 1
+                and abs(nonzero_rows[0][2] - expected_previous_draw) <= 0.01
+                and str(nonzero_rows[0][1].get("allocation_source", "Standard")) == "Standard"
+                and str(nonzero_rows[0][1].get("status", "Forecast")) == "Forecast")
+            if untouched_default and abs(nonzero_rows[0][2] - target_draw) > 0.01:
                 nonzero_rows[0][1]["gross_draw"] = target_draw
                 plan_to_resize[nonzero_rows[0][0]] = nonzero_rows[0][1]
                 drawdown_plan_source = json.dumps(plan_to_resize)
@@ -3219,16 +3265,20 @@ def page_modeler():
             old_full_limit_draw = float(facility_amount)
             old_fee_clamped_draw = max(0.0, float(facility_amount)
                 - cap_fees["admin_total_estimate"] - cap_fees["line_fee_estimate"] - cap_fees["discharge"])
-            legacy_amounts = [old_full_limit_draw, old_fee_clamped_draw]
+            old_cap_fit_default = max(0.0, float(facility_amount) - upfront_total
+                - 0.08 * float(facility_amount))
+            legacy_amounts = [old_full_limit_draw, old_fee_clamped_draw, old_cap_fit_default]
             is_legacy_full_cap_draw = (len(nonzero_rows) == 1 and any(
                 abs(nonzero_rows[0][2] - expected) <= 0.01 for expected in legacy_amounts))
             is_default_forecast = (is_legacy_full_cap_draw
                 and str(nonzero_rows[0][1].get("allocation_source", "Standard")) == "Standard"
                 and str(nonzero_rows[0][1].get("status", "Forecast")) == "Forecast")
             if is_default_forecast:
+                cap_fit_draw = max_bullet_draw_with_full_capitalised_interest(params)
                 corrected_draw = (max(0.0, float(facility_amount) - upfront_total)
                     if current_treatment == "Serviced" else
-                    max(0.0, float(facility_amount) - upfront_total - 0.08 * float(facility_amount)))
+                    (cap_fit_draw if cap_fit_draw is not None else
+                     max(0.0, float(facility_amount) - upfront_total - 0.08 * float(facility_amount))))
                 nonzero_rows[0][1]["gross_draw"] = corrected_draw
                 legacy_plan[nonzero_rows[0][0]] = nonzero_rows[0][1]
                 drawdown_plan_source = json.dumps(legacy_plan)
@@ -3254,8 +3304,14 @@ def page_modeler():
         if interest_treatment == "Serviced":
             st.caption("Serviced interest is paid in cash and does not consume peak outstanding capacity. The borrower draw can use the facility limit less upfront costs funded at settlement; lifetime cash paid may exceed the limit.")
         else:
-            st.caption("Investor Ledger rows use Capital Call movements recorded in the Investor Portal. Forecast rows default to the Senior/Mezz split. Required capital calls equal borrower draw plus upfront costs. Remaining capacity is reserved within the cap for capitalised interest and other charges.")
-        reset_clicked = st.button("Reset to suggested schedule", key=prefix + "reset_drawdown_button")
+            st.caption("Investor Ledger rows use Capital Call movements recorded in the Investor Portal. Forecast rows default to the Senior/Mezz split. Required capital calls equal borrower draw plus upfront costs. Peak cap capacity is used by borrower draw, funded upfront costs and capitalised interest; cash-billed admin, line and discharge fees do not increase outstanding balance.")
+        if (existing_params.get("seed_key") == "demo_bridging_10m_bullet_v1"
+                and interest_treatment == "Capitalised"):
+            st.caption("For this sample bullet loan, the suggested draw is back-solved from the current rate, term, upfront fees and cap so the full forecast interest fits. If you manually increase the draw, the cap-shortfall warning will return.")
+        reset_label = ("Reset to cap-fitted suggested schedule" if
+            existing_params.get("seed_key") == "demo_bridging_10m_bullet_v1"
+            and interest_treatment == "Capitalised" else "Reset to suggested schedule")
+        reset_clicked = st.button(reset_label, key=prefix + "reset_drawdown_button")
         if reset_clicked:
             st.session_state[force_template_key] = True
             st.session_state[reset_count_key] = int(st.session_state[reset_count_key]) + 1
@@ -3293,7 +3349,7 @@ def page_modeler():
         s1, s2, s3, s4 = st.columns(4)
         s1.metric("Borrower cash draw", money(gross_total))
         s2.metric("Investor funding required", money(net_total))
-        s3.metric("Peak cap headroom" if interest_treatment == "Serviced" else "Capacity left for interest / fees", money(capacity_left))
+        s3.metric("Peak cap headroom" if interest_treatment == "Serviced" else "Capacity left for capitalised interest", money(capacity_left))
         s4.metric("Allocation variance", money(net_total - allocation_total))
         if net_total > float(facility_amount) + 0.01:
             st.error("Borrower draws plus upfront costs exceed the facility's peak limit.")
@@ -3412,7 +3468,7 @@ def page_modeler():
         else:
             st.markdown('<div class="covenant-ok">All projected LVRs are within the selected covenant.</div>', unsafe_allow_html=True)
         if interest_treatment == "Capitalised":
-            st.caption(f"Capitalised interest accrues on ACT/365 against each period’s outstanding balance and is posted to principal every {capitalisation_interval_text}, with any final stub capitalised at maturity or payoff. It must fit inside the facility limit; ‘Interest Not Charged (cap)’ exposes any contractual accrual that did not fit.")
+            st.caption(f"Capitalised interest accrues on ACT/365 against each period’s outstanding balance and is posted to principal every {capitalisation_interval_text}, with any final stub capitalised at maturity or payoff. Borrower draws, funded upfront costs and capitalised interest count toward the peak facility cap; cash-billed admin, line and discharge fees do not. ‘Interest Not Charged (cap)’ shows any contractual accrual that exceeds remaining capacity.")
         else:
             st.caption("Interest in advance is collected on each Drawdown Date. ‘Due on Payment Date’ excludes that prepayment, so it is not counted twice at maturity.")
         if net_advance_interest_from_proceeds:
@@ -3599,7 +3655,7 @@ def page_modeler():
         st.subheader("Platform economics")
         economics_note = ("The limit applies to peak outstanding; cash-serviced interest is billed separately and may make lifetime receipts exceed the limit."
             if interest_treatment == "Serviced" else
-            "Borrower draw, funded upfront costs, capitalised interest and scheduled charges are constrained within the facility limit.")
+            "Borrower draw, funded upfront costs and capitalised interest are constrained within peak outstanding. Cash-billed admin, line and discharge fees are separate and do not consume the cap.")
         st.caption("Income, investor interest expense and funded upfront-cost expense are modelled from the current contractual schedule. " + economics_note)
         st.dataframe(pnl_display, use_container_width=True, hide_index=True)
         c1, c2, c3 = st.columns(3)
@@ -3621,7 +3677,7 @@ def page_modeler():
         st.subheader("SPV cashflows by event date")
         cashflow_cap_note = ("The facility limit caps peak outstanding; cash-serviced interest and fees paid over the term are outside that peak-balance test."
             if interest_treatment == "Serviced" else
-            "The facility limit includes borrower draws, funded upfront costs, capitalised interest and scheduled charges.")
+            "The facility limit caps peak outstanding: borrower draws, funded upfront costs and capitalised interest count; cash-billed admin, line and discharge fees do not.")
         st.caption(cashflow_cap_note + " Investor calls, repayments, distributions and other movements are recorded on their transaction dates; forecast servicing and scheduled principal remain on settlement anniversaries.")
         cashflow_format = {column: "${:,.0f}" for column in cashflow_df.columns if column != "Date"}
         st.dataframe(cashflow_df.style.format(cashflow_format), use_container_width=True, hide_index=True, height=420)
