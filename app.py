@@ -82,17 +82,40 @@ def date_year_fraction(start_date, end_date):
 
 
 def annual_rate_for_days(annual_rate, days):
+    """Convert an effective annual investor target into an effective period rate."""
     if annual_rate <= -1:
         return -1.0
     return (1.0 + annual_rate) ** (max(days, 0) / 365.0) - 1.0
 
 
-def initial_advance_interest_amount(facility_amount, annual_rate, settlement, months):
-    settlement = parse_date(settlement, date.today())
-    months = max(0, int(months))
-    return sum(max(0.0, float(facility_amount)) * annual_rate_for_days(
-        float(annual_rate), max((add_months(settlement, month_index + 1)
-        - add_months(settlement, month_index)).days, 1)) for month_index in range(months))
+def borrower_rate_for_days(annual_rate, days):
+    """Borrower contract accrual: simple ACT/365 annual rate times actual days."""
+    return float(annual_rate) * max(days, 0) / 365.0
+
+
+def serviced_interest_for_period(principal, start_date, end_date, annual_rate, receipt_events=None):
+    """Accrue simple ACT/365 cash interest; dated principal receipts reduce capital, interest does not compound."""
+    start_date = parse_date(start_date)
+    end_date = parse_date(end_date, start_date)
+    if start_date is None or end_date is None or end_date <= start_date:
+        return 0.0
+    balance = max(0.0, float(principal))
+    cursor = start_date
+    total_interest = 0.0
+    events = [event for event in (receipt_events or []) if isinstance(event, dict)]
+    events.sort(key=lambda event: parse_date(event.get("receipt_date"), end_date))
+    for event in events:
+        event_date = parse_date(event.get("receipt_date"), end_date)
+        if event_date < start_date or event_date > end_date:
+            continue
+        if event_date > cursor and balance > 0:
+            total_interest += balance * borrower_rate_for_days(annual_rate, (event_date - cursor).days)
+        principal_received = max(0.0, float(event.get("principal", 0.0) or 0.0))
+        balance = max(0.0, balance - principal_received)
+        cursor = max(cursor, event_date)
+    if end_date > cursor and balance > 0:
+        total_interest += balance * borrower_rate_for_days(annual_rate, (end_date - cursor).days)
+    return total_interest
 
 
 def capitalised_interest_for_period(principal, start_date, end_date, annual_rate, receipt_events=None):
@@ -111,14 +134,12 @@ def capitalised_interest_for_period(principal, start_date, end_date, annual_rate
         if event_date < start_date or event_date > end_date:
             continue
         if event_date > cursor and balance > 0:
-            accrued = balance * annual_rate_for_days(annual_rate, (event_date - cursor).days)
-            balance += accrued
-            total_interest += accrued
+            total_interest += balance * borrower_rate_for_days(annual_rate, (event_date - cursor).days)
         principal_received = max(0.0, float(event.get("principal", 0.0) or 0.0))
         balance = max(0.0, balance - principal_received)
         cursor = max(cursor, event_date)
     if end_date > cursor and balance > 0:
-        accrued = balance * annual_rate_for_days(annual_rate, (end_date - cursor).days)
+        accrued = balance * borrower_rate_for_days(annual_rate, (end_date - cursor).days)
         total_interest += accrued
     return total_interest
 
@@ -758,28 +779,13 @@ def build_schedule(params, actuals_map, drawdown_map):
     # The cap is a peak-outstanding test: borrower draws, funded upfront costs and
     # capitalised interest count. Admin, line and discharge fees are billed in cash
     # and are not added to principal, so they must not consume outstanding capacity.
-    advance_setting = params.get("interest_advance_months", 1)
-    all_interest_in_advance = str(advance_setting).strip().lower() == "all"
+    interval_setting = params.get("interest_advance_months", 1)
     try:
-        advance_months = term if all_interest_in_advance else max(1, min(term, int(advance_setting)))
+        capitalisation_interval = max(1, min(term, int(interval_setting)))
     except (TypeError, ValueError):
-        advance_months = 1
-    capitalisation_interval = advance_months if interest_treatment == "Capitalised" else 1
-    first_planned_draw = 0.0
-    for plan_key, plan_value in sorted(drawdown_map.items()):
-        if isinstance(plan_value, dict):
-            candidate_draw = max(0.0, float(plan_value.get("gross_draw", plan_value.get("amount", 0.0)) or 0.0))
-        else:
-            candidate_draw = max(0.0, float(plan_value or 0.0))
-        if candidate_draw > 0:
-            first_planned_draw = candidate_draw
-            break
-    initial_advance_interest = (initial_advance_interest_amount(
-        first_planned_draw or facility_amount, annual_rate, settlement, advance_months)
-        if interest_treatment == "Serviced" else 0.0)
-    net_advance_interest_from_proceeds = (interest_treatment == "Serviced"
-        and all_interest_in_advance
-        and facility_type in ["Bridging", "Residual Stock"])
+        capitalisation_interval = 1
+    # Serviced interest is assessed for the period just completed and due at Payment_Date.
+    # Capitalised interest never collects borrower cash in advance.
 
     rows = []
     balance = 0.0
@@ -857,8 +863,7 @@ def build_schedule(params, actuals_map, drawdown_map):
             upfront_deducted = min(fees["upfront_total"], upfront_room)
             first_draw_done = True
         investor_funding = max(0.0, gross_draw + upfront_deducted)
-        advance_interest_withheld = (min(initial_advance_interest, investor_funding)
-            if index == 0 and is_first_draw and net_advance_interest_from_proceeds else 0.0)
+        advance_interest_withheld = 0.0
         net_draw = max(0.0, gross_draw - advance_interest_withheld)
         balance_after_draw = opening_balance + gross_draw + upfront_deducted
         cumulative_drawn += gross_draw
@@ -887,11 +892,10 @@ def build_schedule(params, actuals_map, drawdown_map):
             else:
                 # Keep forecast-period interest through the scheduled anniversary; actual
                 # principal receipts reduce the balance for the next forecast period.
-                interest_accrued = balance_after_draw * annual_rate_for_days(annual_rate, days)
+                interest_accrued = balance_after_draw * borrower_rate_for_days(annual_rate, days)
         else:
-            interest_principal = (max(0.0, cumulative_drawn)
-                if index < advance_months else balance_after_draw)
-            interest_accrued = interest_principal * annual_rate_for_days(annual_rate, days)
+            # Use the period-end capital base before this period's interest is added.
+            interest_accrued = balance_after_draw * borrower_rate_for_days(annual_rate, days)
         gross_interest_accrued = max(0.0, float(interest_accrued))
         interest_cap_shortfall = 0.0
         if interest_treatment == "Capitalised" and not bool(actual.get("payment_actuals_logged", False)):
@@ -900,10 +904,6 @@ def build_schedule(params, actuals_map, drawdown_map):
             interest_accrued = min(interest_accrued, available_for_interest)
             interest_cap_shortfall = max(0.0, gross_interest_accrued - interest_accrued)
         if after_payoff or interest_treatment == "Capitalised":
-            interest_due = 0.0
-        elif index == 0:
-            interest_due = initial_advance_interest
-        elif index < advance_months:
             interest_due = 0.0
         else:
             interest_due = interest_accrued
@@ -947,18 +947,15 @@ def build_schedule(params, actuals_map, drawdown_map):
                                    if has_payment_actuals else None)
         servicing_interest_due = interest_due
         if has_payment_actuals:
-            # Serviced payoff interest is charged through the payoff date, preserving any prepaid minimum.
+            # Serviced payoff interest is charged through the payoff date on the pre-interest balance.
             events = list(period_receipt_events)
             accrual_end = min([payment_date] + period_payoff_dates) if period_payoff_dates else payment_date
             if period_payoff_dates and interest_treatment == "Serviced":
-                days_to_payoff = max((accrual_end - draw_date).days, 0)
-                payoff_principal = facility_amount if index < advance_months else balance_after_draw
-                partial_accrual = payoff_principal * annual_rate_for_days(annual_rate, days_to_payoff)
-                required_through_payoff = max(initial_advance_interest, cumulative_interest + partial_accrual)
-                baseline_before_period = (0.0 if index == 0
-                    else max(initial_advance_interest, cumulative_interest))
-                servicing_interest_due = max(0.0, required_through_payoff - baseline_before_period)
+                partial_accrual = serviced_interest_for_period(
+                    balance_after_draw, draw_date, accrual_end, annual_rate, period_receipt_events)
+                servicing_interest_due = partial_accrual
                 interest_accrued = partial_accrual
+                gross_interest_accrued = partial_accrual
                 interest_due = servicing_interest_due
             cash_servicing_interest_due = max(0.0, servicing_interest_due - advance_interest_withheld)
             # Charge ACT/365 interest on overdue serviced interest only, stopping at receipts.
@@ -976,28 +973,27 @@ def build_schedule(params, actuals_map, drawdown_map):
                 event_date = parse_date(event.get("receipt_date"), payment_date)
                 event_date = max(draw_date, min(event_date, accrual_end))
                 if event_date > accrual_cursor and accrual_balance > 0:
-                    penalty_interest += accrual_balance * annual_rate_for_days(
+                    penalty_interest += accrual_balance * borrower_rate_for_days(
                         annual_rate, (event_date - accrual_cursor).days)
                 accrual_cursor = max(accrual_cursor, event_date)
                 accrual_balance = max(0.0, accrual_balance - max(0.0, float(event.get("interest", 0.0) or 0.0)))
                 if accrual_cursor >= accrual_end:
                     break
             if accrual_end > accrual_cursor and accrual_balance > 0:
-                penalty_interest += accrual_balance * annual_rate_for_days(
+                penalty_interest += accrual_balance * borrower_rate_for_days(
                     annual_rate, (accrual_end - accrual_cursor).days)
-            # Penalty charges are separate; prepaid interest withheld at settlement is already paid.
+            # Penalty charges are separate from current-period contractual interest.
             arrears = max(0.0, arrears_opening + cash_servicing_interest_due - float(actual_interest or 0.0))
             principal_applied = min(float(actual_principal or 0.0), principal_base)
             cash_interest_received = float(actual_interest or 0.0) + float(actual_penalty_interest or 0.0)
             cash_principal_received = float(actual_principal or 0.0)
             cash_fees_received = float(actual_fees or 0.0)
         else:
-            penalty_interest = arrears_opening * annual_rate_for_days(annual_rate, days) if arrears_opening > 0 else 0.0
+            penalty_interest = arrears_opening * borrower_rate_for_days(annual_rate, days) if arrears_opening > 0 else 0.0
             cash_servicing_interest_due = max(0.0, servicing_interest_due - advance_interest_withheld)
             principal_applied = contract_principal
-            cash_interest_advance = (cash_servicing_interest_due
-                if interest_treatment == "Serviced" else 0.0)
-            cash_interest_received = cash_interest_advance + penalty_interest
+            cash_interest_advance = 0.0
+            cash_interest_received = cash_servicing_interest_due + penalty_interest
             cash_principal_received = contract_principal
             cash_fees_received = line_fee + admin_fee + discharge_fee
         if has_payment_actuals:
@@ -1020,8 +1016,7 @@ def build_schedule(params, actuals_map, drawdown_map):
             cumulative_upfront_fees_repaid += cash_upfront_fee_received
             cash_fees_received += cash_upfront_fee_received
             cash_interest_received += cash_capitalised_interest_received
-        # Advances are collected on the draw date, not again on the anniversary payment date.
-        # Total_Due is the amount due on Payment_Date; Cash_Interest_Advance is shown separately.
+        # Current-period Serviced interest is payable on Payment_Date; no advance is duplicated.
         interest_due_on_payment_date = max(0.0, cash_servicing_interest_due - cash_interest_advance)
         total_due = (arrears_opening + interest_due_on_payment_date + penalty_interest + contract_principal
                      + line_fee + admin_fee + discharge_fee)
@@ -1053,13 +1048,14 @@ def build_schedule(params, actuals_map, drawdown_map):
         else:
             if cash_interest_advance > 0:
                 borrower_cashflows.append((draw_date, cash_interest_advance))
-            payment_cashflow = penalty_interest + contract_principal + line_fee + admin_fee + discharge_fee
+            payment_cashflow = (interest_due_on_payment_date + penalty_interest + contract_principal
+                + line_fee + admin_fee + discharge_fee)
             if payment_cashflow > 0:
                 borrower_cashflows.append((payment_date, payment_cashflow))
 
         rows.append({
             "Drawdown_Date": draw_date,
-            "Interest_Due_Date": draw_date,
+            "Interest_Due_Date": payment_date,
             "Payment_Date": payment_date,
             "Period_Days": days,
             "Planned_Drawdown": planned_draw,
@@ -1099,6 +1095,7 @@ def build_schedule(params, actuals_map, drawdown_map):
             "Cash_Interest_Received": cash_interest_received,
             "Cash_Penalty_Interest_Received": float(actual_penalty_interest or 0.0) if has_payment_actuals else penalty_interest,
             "Cash_Interest_Advance": cash_interest_advance,
+            "Cash_Serviced_Interest_Due": 0.0 if has_payment_actuals else interest_due_on_payment_date,
             "Cash_Capitalised_Interest_Received": cash_capitalised_interest_received,
             "Cash_Arrears_Interest": float(actual_penalty_interest or 0.0) if has_payment_actuals else penalty_interest,
             "Cash_Principal_Received": cash_principal_received,
@@ -1814,10 +1811,11 @@ def build_cashflows(schedule_df, investor_ledger_df, fees, investor_cashflows=No
             event["Borrower_Principal_Received"] += residual["principal"]
             event["Borrower_Fees_Received"] += residual["fees"]
         else:
-            # Contractual interest in advance is a dated cashflow on the draw/anniversary date.
-            interest_date = parse_date(row.get("Interest_Due_Date"), draw_date)
+            # Serviced interest for the completed period is a cashflow on Payment_Date.
+            interest_date = parse_date(row.get("Interest_Due_Date"), payment_date)
             bucket(interest_date)["Borrower_Interest_Received"] += float(row.get("Cash_Interest_Advance", 0.0) or 0.0)
             payment_event = bucket(payment_date)
+            payment_event["Borrower_Interest_Received"] += float(row.get("Cash_Serviced_Interest_Due", 0.0) or 0.0)
             payment_event["Borrower_Interest_Received"] += float(row.get("Cash_Arrears_Interest", 0.0) or 0.0)
             payment_event["Borrower_Interest_Received"] += float(row.get("Cash_Capitalised_Interest_Received", 0.0) or 0.0)
             payment_event["Borrower_Principal_Received"] += float(row["Cash_Principal_Received"])
@@ -2330,16 +2328,6 @@ def contractual_interest_through(schedule_df, params, cutoff_date):
     cutoff = parse_date(cutoff_date, settlement)
     if cutoff <= settlement or schedule_df.empty:
         return 0.0
-    raw_treatment = str(params.get("interest_treatment", "Serviced")).strip().lower()
-    capitalised = raw_treatment in ["capitalised", "capitalized"]
-    advance_setting = params.get("interest_advance_months", 1)
-    try:
-        advance_months = (int(params.get("term_months", len(schedule_df)))
-            if str(advance_setting).strip().lower() == "all"
-            else max(1, min(int(params.get("term_months", len(schedule_df))), int(advance_setting))))
-    except (TypeError, ValueError):
-        advance_months = 1
-    facility_amount = max(0.0, float(params.get("facility_amount", 0.0) or 0.0))
     rate = float(params.get("borrower_irr", 12.0)) / 100.0
     total = 0.0
     for index, (_, row) in enumerate(schedule_df.iterrows()):
@@ -2349,12 +2337,8 @@ def contractual_interest_through(schedule_df, params, cutoff_date):
             continue
         segment_end = min(end, cutoff)
         days = max((segment_end - start).days, 0)
-        if capitalised:
-            principal = max(0.0, float(row.get("Balance_After_Draw", 0.0) or 0.0))
-        else:
-            principal = (facility_amount if index < advance_months
-                else max(0.0, float(row.get("Balance_After_Draw", 0.0) or 0.0)))
-        total += principal * annual_rate_for_days(rate, days)
+        principal = max(0.0, float(row.get("Balance_After_Draw", 0.0) or 0.0))
+        total += principal * borrower_rate_for_days(rate, days)
         if cutoff <= end:
             break
     return total
@@ -2385,11 +2369,11 @@ def arrears_penalty_through(period_row, params, previous_period, cutoff_date, in
             continue
         event_date = max(start, min(event_date, cutoff))
         if event_date > cursor and outstanding > 0:
-            accrued += outstanding * annual_rate_for_days(rate, (event_date - cursor).days)
+            accrued += outstanding * borrower_rate_for_days(rate, (event_date - cursor).days)
         cursor = max(cursor, event_date)
         outstanding = max(0.0, outstanding - max(0.0, float(receipt.get("interest", 0.0) or 0.0)))
     if cutoff > cursor and outstanding > 0:
-        accrued += outstanding * annual_rate_for_days(rate, (cutoff - cursor).days)
+        accrued += outstanding * borrower_rate_for_days(rate, (cutoff - cursor).days)
     paid_penalty = float(previous_period["penalty_interest"].fillna(0).sum()) if not previous_period.empty else 0.0
     return max(0.0, accrued - paid_penalty)
 
@@ -2431,11 +2415,10 @@ def suggest_receipt_allocations(parent_deal_id, receipt_date, amount,
             cutoff = min(parse_date(interest_through_date, receipt_date), receipt_date)
             cutoff = max(cutoff, settlement)
             penalty_cutoff = cutoff
-            minimum_interest = 0.0 if capitalised else float(schedule.iloc[0]["Interest_Due"])
-            required_contract_interest = (0.0 if capitalised else max(minimum_interest,
-                contractual_interest_through(schedule, params, cutoff)))
+            required_contract_interest = (0.0 if capitalised else
+                contractual_interest_through(schedule, params, cutoff))
             prior_accrued = float(schedule.iloc[:current_index]["Interest_Accrued"].sum()) if current_index > 0 else 0.0
-            baseline_before_period = 0.0 if current_index == 0 else max(minimum_interest, prior_accrued)
+            baseline_before_period = prior_accrued
             payoff_period_interest_due = (0.0 if capitalised else
                 max(0.0, required_contract_interest - baseline_before_period))
             if not previous.empty:
@@ -2444,25 +2427,15 @@ def suggest_receipt_allocations(parent_deal_id, receipt_date, amount,
                 prior_contract_interest = float(paid_before_cutoff["interest"].fillna(0).sum())
             else:
                 prior_contract_interest = 0.0
-            prepaid_interest_credit = 0.0
-            if not capitalised and "Advance_Interest_Withheld" in schedule:
-                draw_dates = pd.to_datetime(schedule["Drawdown_Date"], errors="coerce").dt.date
-                prepaid_interest_credit = float(schedule.loc[draw_dates <= cutoff,
-                    "Advance_Interest_Withheld"].fillna(0).sum())
             interest_due = (0.0 if capitalised else max(0.0,
-                required_contract_interest - prior_contract_interest - prepaid_interest_credit))
+                required_contract_interest - prior_contract_interest))
         else:
             cutoff = max(settlement, last_settlement_anniversary(settlement, receipt_date))
             due_rows = schedule[pd.to_datetime(schedule["Interest_Due_Date"]).dt.date <= cutoff]
             required_contract_interest = 0.0 if capitalised else float(due_rows["Interest_Due"].fillna(0).sum())
             prior_contract_interest = float(previous["interest"].fillna(0).sum()) if not previous.empty else 0.0
-            prepaid_interest_credit = 0.0
-            if not capitalised and "Advance_Interest_Withheld" in schedule:
-                draw_dates = pd.to_datetime(schedule["Drawdown_Date"], errors="coerce").dt.date
-                prepaid_interest_credit = float(schedule.loc[draw_dates <= cutoff,
-                    "Advance_Interest_Withheld"].fillna(0).sum())
             interest_due = (0.0 if capitalised else max(0.0,
-                required_contract_interest - prior_contract_interest - prepaid_interest_credit))
+                required_contract_interest - prior_contract_interest))
         penalty_due = arrears_penalty_through(current, params, period_previous, penalty_cutoff,
             payoff_period_interest_due if is_payoff else None)
         if capitalised:
@@ -2904,40 +2877,27 @@ def page_modeler():
                 help="Serviced: interest is paid in cash and does not increase outstanding, but the final payment (including due-date interest and fees) is capped at the facility. Capitalised: interest increases principal; both peak outstanding and the all-in final payment must fit. Earlier cash interest payments may make lifetime receipts exceed the limit.")
 
             stored_advance = existing_params.get("interest_advance_months", 1)
-            all_advance_default = str(stored_advance).strip().lower() == "all"
             try:
-                advance_months_default = int(stored_advance) if not all_advance_default else 1
+                advance_months_default = int(stored_advance)
             except (TypeError, ValueError):
                 advance_months_default = 1
             advance_months_default = max(1, min(int(term_months), advance_months_default))
-            init_widget_state(prefix + "interest_advance_all", all_advance_default)
             init_widget_state(prefix + "interest_advance_months", advance_months_default)
-            adv1, adv2 = st.columns([1, 2])
-            interest_advance_all = adv1.checkbox("All serviced interest for the full term in advance",
-                key=prefix + "interest_advance_all", disabled=interest_treatment == "Capitalised")
             if st.session_state[prefix + "interest_advance_months"] > int(term_months):
                 st.session_state[prefix + "interest_advance_months"] = int(term_months)
-            months_label = ("Capitalisation interval (months)" if interest_treatment == "Capitalised"
-                            else "Initial months’ interest in advance")
-            months_help = ("No cash is collected up front. Accrued ACT/365 interest is added to principal every N settlement anniversaries; any remaining accrual is capitalised at maturity or payoff."
-                if interest_treatment == "Capitalised" else
-                "Collect this many months of interest in advance. After the initial coverage, interest is billed one month in advance each month.")
-            interest_advance_months = adv2.number_input(months_label,
-                min_value=1, max_value=int(term_months), step=1,
-                key=prefix + "interest_advance_months",
-                disabled=(interest_treatment == "Serviced" and interest_advance_all),
-                help=months_help)
-            interest_advance_setting = ("All" if interest_treatment == "Serviced" and interest_advance_all
-                                        else int(interest_advance_months))
-            capitalisation_interval_text = (f"{int(interest_advance_months)} month"
-                if int(interest_advance_months) == 1 else f"{int(interest_advance_months)} months")
-            net_advance_interest_from_proceeds = (interest_treatment == "Serviced"
-                and str(interest_advance_setting).strip().lower() == "all"
-                and normalize_facility_type(facility_type) in ["Bridging", "Residual Stock"])
             if interest_treatment == "Capitalised":
-                st.caption(f"Interest is not collected in advance. It accrues ACT/365 on the outstanding balance for each period and is added to principal every {capitalisation_interval_text}, with the final accrual capitalised at maturity or payoff.")
+                interest_advance_months = st.number_input("Capitalisation interval (months)",
+                    min_value=1, max_value=int(term_months), step=1,
+                    key=prefix + "interest_advance_months",
+                    help="Accrue simple ACT/365 interest monthly on the pre-interest period-end balance. Keep it pending between dates, then add the accumulated amount to principal every N months. No interest-on-pending-interest is charged before it is capitalised.")
+                interest_advance_setting = int(interest_advance_months)
+                capitalisation_interval_text = (f"{int(interest_advance_months)} month"
+                    if int(interest_advance_months) == 1 else f"{int(interest_advance_months)} months")
+                st.caption(f"Borrower interest uses simple ACT/365 (stated annual rate × actual days ÷ 365) on the pre-interest closing balance for each period. Accrued interest is added to principal every {capitalisation_interval_text}; any final stub is capitalised at maturity or payoff.")
             else:
-                st.caption("The selected initial interest coverage is collected in advance; afterward, serviced interest is billed one month in advance.")
+                interest_advance_setting = int(st.session_state[prefix + "interest_advance_months"])
+                capitalisation_interval_text = "1 month"
+                st.caption("Serviced interest uses simple ACT/365 on the pre-interest closing balance for the current period. It is charged in cash at that period’s payment date and does not increase principal.")
 
             construction_default = int(existing_params.get("construction_months", min(6, int(term_months))))
             construction_default = max(0, min(int(term_months), construction_default))
@@ -3040,7 +3000,8 @@ def page_modeler():
 
             init_widget_state(prefix + "borrower_irr", float(existing_params.get("borrower_irr", 12.0)))
             borrower_irr = c9.number_input("Borrower rate (% p.a.)", min_value=0.0, max_value=50.0,
-                step=0.25, key=prefix + "borrower_irr")
+                step=0.25, key=prefix + "borrower_irr",
+                help="Borrower contract interest uses simple ACT/365: stated annual rate × actual days ÷ 365. Investor target returns remain effective annual rates.")
 
             c10, c11, c12 = st.columns(3)
             init_widget_state(prefix + "cpr", float(existing_params.get("cpr", 0.0)))
@@ -3549,24 +3510,21 @@ def page_modeler():
         else:
             st.markdown('<div class="covenant-ok">All projected LVRs are within the selected covenant.</div>', unsafe_allow_html=True)
         if interest_treatment == "Capitalised":
-            st.caption(f"Capitalised interest accrues on ACT/365 against each period’s outstanding balance and is posted to principal every {capitalisation_interval_text}, with any final stub capitalised at maturity or payoff. Peak outstanding and the all-in amount due on each date are both capped. Final-period admin, line and discharge fees are reserved inside the maturity-payment limit; forecast draws are back-solved accordingly.")
+            st.caption(f"Borrower interest uses simple ACT/365 (stated annual rate × actual days ÷ 365) on the pre-interest period balance, then posts to principal every {capitalisation_interval_text}, with any final stub posted at maturity or payoff. Peak outstanding and the all-in amount due on each date are both capped. Final-period fees are reserved inside the maturity-payment limit; forecast draws are back-solved accordingly.")
         else:
-            st.caption("Interest in advance is collected on each Drawdown Date. ‘Due on Payment Date’ excludes that prepayment, so it is not counted twice at maturity.")
-        if net_advance_interest_from_proceeds:
-            st.caption("All-term serviced interest for this Bridging / Residual Stock facility is withheld from the initial proceeds. It is shown separately from cash interest due and is not charged again on the settlement date.")
+            st.caption("Serviced interest shown as due is for the current period and is collected on the Payment Date (month-end); no interest is collected in advance.")
 
         display_cols = ["Drawdown_Date", "Payment_Date", "Drawdown_Gross", "Upfront_Fees_Deducted",
-            "Advance_Interest_Withheld", "Investor_Funding", "Drawdown_Net", "Opening_Balance",
+            "Investor_Funding", "Drawdown_Net", "Opening_Balance",
             "Balance_After_Draw", "Gross_Interest_Accrued", "Interest_Accrued", "Interest_Cap_Shortfall",
             "Capitalised_Interest", "Balance_After_Capitalisation",
-            "Interest_Due", "Cash_Interest_Advance", "Penalty_Interest", "Line_Fee", "Admin_Fee", "Discharge_Fee",
+            "Interest_Due", "Penalty_Interest", "Line_Fee", "Admin_Fee", "Discharge_Fee",
             "Scheduled_Principal", "Prepayment", "Maturity_Repayment", "Contract_Principal_Due",
             "Actual_Interest", "Actual_Principal", "Actual_Fees", "Total_Due",
             "Arrears", "Principal_Applied", "Ending_Balance", "Property_Value", "LVR_pct", "Covenant_Breach"]
         display = schedule_df[display_cols].rename(columns={
             "Drawdown_Date": "Drawdown Date", "Payment_Date": "Payment Date",
             "Drawdown_Gross": "Borrower Cash Draw", "Upfront_Fees_Deducted": "Upfront Costs Funded",
-            "Advance_Interest_Withheld": "Advance Interest Withheld",
             "Investor_Funding": "Investor Funding", "Drawdown_Net": "Net Drawdown",
             "Opening_Balance": "Opening Balance", "Balance_After_Draw": "Balance After Draw",
             "Gross_Interest_Accrued": "Gross Interest (before cap)",
@@ -3574,7 +3532,7 @@ def page_modeler():
             "Interest_Cap_Shortfall": "Interest Not Charged (cap)",
             "Capitalised_Interest": "Capitalised Interest",
             "Balance_After_Capitalisation": "Balance After Capitalisation",
-            "Interest_Due": "Interest Assessed", "Cash_Interest_Advance": "Cash Interest Advance",
+            "Interest_Due": "Current Period Interest Due",
             "Penalty_Interest": "Penalty Interest", "Line_Fee": "Line Fee", "Admin_Fee": "Admin Fee",
             "Discharge_Fee": "Discharge Fee", "Scheduled_Principal": "Scheduled Principal",
             "Prepayment": "Prepayment", "Maturity_Repayment": "Maturity Repayment",
@@ -3634,13 +3592,11 @@ def page_modeler():
         existing_actual = actuals_map.get(selected_payment_date.isoformat(), {})
         existing_override = bool(existing_actual.get("drawdown_override", False))
         existing_payment_log = bool(existing_actual.get("payment_actuals_logged", False))
-        advance_note = (f" · interest advance on draw date **{money(selected_row['Cash_Interest_Advance'])}**"
-            if float(selected_row.get("Cash_Interest_Advance", 0.0) or 0.0) > 0 else "")
-        st.write(f"Draw period starts **{selected_row['Drawdown_Date'].strftime('%d %b %Y')}** · due on payment date **{money(selected_row['Total_Due'])}**{advance_note} · planned draw **{money(selected_row['Planned_Drawdown'])}**")
+        st.write(f"Draw period starts **{selected_row['Drawdown_Date'].strftime('%d %b %Y')}** · due on payment date **{money(selected_row['Total_Due'])}** · planned draw **{money(selected_row['Planned_Drawdown'])}**")
         if interest_treatment == "Capitalised":
             st.info(f"Capitalised interest accrues on ACT/365 and is added to principal every {capitalisation_interval_text} (and at payoff or maturity); no advance cash collection is made.")
-        elif float(selected_row.get("Advance_Interest_Withheld", 0.0) or 0.0) > 0:
-            st.info(f"{money(selected_row['Advance_Interest_Withheld'])} of advance interest was withheld from initial proceeds and is not included again in scheduled cash due.")
+        else:
+            st.info(f"Serviced interest for this period: {money(selected_row['Interest_Due'])}, payable on the payment date.")
 
         with st.form(prefix + "actuals_form"):
             override_key = prefix + "actual_override_" + selected_payment_date.isoformat()
@@ -3881,7 +3837,7 @@ def page_borrower_servicing():
     parent_id = root_labels[root_label]
     root_row = roots[roots["id"] == parent_id].iloc[0]
     facilities = deals[deals["parent_deal_id"] == parent_id].copy()
-    st.caption("Record each receipt on its actual value date. Forecast repayment and interest periods remain anchored to settlement anniversaries: partial actual principal reduces the balance for the next forecast period, while current-period forecast interest continues through the anniversary. For a payoff, enter an interest-through date; the selected minimum prepaid period remains due, with excess advance interest credited.")
+    st.caption("Record each receipt on its actual value date. Forecast repayment and interest periods remain anchored to settlement anniversaries. Serviced interest is charged for the current period on its pre-interest closing balance and is due at the payment date; for an earlier payoff, enter the interest-through date so ACT/365 interest stops on that date.")
 
     c1, c2, c3 = st.columns(3)
     receipt_date = c1.date_input("Receipt / value date", value=date.today(), key=f"receipt_date_{parent_id}")
